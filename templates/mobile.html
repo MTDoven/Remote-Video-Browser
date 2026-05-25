@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AV1 Video Browser</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='mobile.css') }}">
+  </head>
+  <body>
+    <main class="mobile-shell">
+      <header class="mobile-header">
+        <p class="eyebrow">Mobile playback</p>
+        <h1>AV1 Video Browser</h1>
+        <p class="root-path">{{ root }}</p>
+      </header>
+
+      <section class="player-card">
+        <div class="player-card-head">
+          <div>
+            <h2>{{ selected_video.name if selected_video else 'Select an AV1 video' }}</h2>
+            <p>
+              {% if selected_video %}
+                {{ selected_video.folder }} · {{ selected_video.size_label }} · {{ selected_video.modified_label }}
+              {% else %}
+                Browser native <video> controls
+              {% endif %}
+            </p>
+          </div>
+        </div>
+
+        <div class="player-frame">
+          {% if selected_video_url %}
+            <video controls autoplay preload="metadata" playsinline src="{{ selected_video_url }}"></video>
+          {% else %}
+            <div class="placeholder">
+              <strong>Select a video to play it here</strong>
+              <span>The browser decodes the AV1 file directly.</span>
+            </div>
+          {% endif %}
+        </div>
+      </section>
+
+      <nav class="breadcrumbs" aria-label="Breadcrumb">
+        {% for crumb in listing.breadcrumbs %}
+          {% if not loop.first %}<span>/</span>{% endif %}
+          <a href="{{ url_for('index', dir=crumb.path) }}">{{ crumb.name }}</a>
+        {% endfor %}
+      </nav>
+
+      <section class="library">
+        {% if listing.parent is not none %}
+          <a class="entry folder" href="{{ url_for('index', dir=listing.parent) }}">
+            <span class="entry-name">📁 ..</span>
+            <span class="entry-meta">Parent directory</span>
+          </a>
+        {% endif %}
+
+        {% for folder in listing.folders %}
+          <a class="entry folder" href="{{ folder.page_url }}">
+            <span class="entry-name">📁 {{ folder.name }}</span>
+            <span class="entry-meta">{{ folder.modified_label }}</span>
+          </a>
+        {% endfor %}
+
+        {% for video in listing.videos %}
+          <a class="entry video{% if selected_video and selected_video.relative_path == video.relative_path %} active{% endif %}" href="{{ video.page_url }}">
+            <span class="entry-name">{{ video.name }}</span>
+            <span class="entry-meta">{{ video.folder }} · {{ video.size_label }} · {{ video.modified_label }}</span>
+          </a>
+        {% endfor %}
+      </section>
+    </main>
+  </body>
+</html>

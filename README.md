@@ -1,19 +1,20 @@
-# AV1 Video Browser
+# Remote Video Browser
 
-A local Flask video browser for native playback. The server scans one directory level at a time and serves AV1-encoded video files directly to the browser's built-in player.
+A local Flask video browser for native playback. The server scans one directory level at a time and serves supported video files directly to the browser's built-in player.
 
 ## Features
 
 - Directory browsing with breadcrumbs and one-level-at-a-time navigation.
 - Native browser playback with standard `<video>` controls.
-- MKV files are remuxed to a temporary MP4 when needed.
+- Common browser-playable video containers are supported directly.
+- Non-native containers such as MKV, MOV, AVI, WMV, TS, and M2TS are remuxed to a temporary MP4 when needed.
 - Range responses for streaming-friendly seeking.
 - Mobile browsers are automatically routed to a dedicated mobile layout.
 
 ## Requirements
 
 - Python 3.11 or newer.
-- A modern browser with AV1 playback support.
+- A modern browser with video playback support.
 - FFmpeg available on `PATH`, or via `FFMPEG_BIN`, for MKV remuxing.
 
 ## Installation
@@ -51,7 +52,6 @@ conda run -n videos python -m pytest -q
 
 The browser lists files with these extensions:
 
-`.mp4`, `.m4v`, `.webm`, `.ogg`, `.ogv`.
-`.mkv` files are accepted too and are remuxed to a temporary MP4 for playback.
+`.mp4`, `.m4v`, `.webm`, `.ogg`, `.ogv`, `.mkv`, `.mov`, `.avi`, `.wmv`, `.ts`, `.m2ts`.
 
-The files are served as-is, so the video container and codec must already be supported by the browser.
+Direct-play containers are served as-is. Containers that Chrome usually does not handle directly are remuxed to a temporary MP4, so the underlying video/audio codecs still need to be browser-decodable.

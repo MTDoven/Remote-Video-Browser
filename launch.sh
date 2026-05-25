@@ -28,16 +28,21 @@ CONDA_BIN="$(find_conda)" || {
   exit 1
 }
 
-kill_port() {
+port_pids() {
   local port="$1"
-  local pids=""
 
   if command -v lsof >/dev/null 2>&1; then
-    pids="$(lsof -ti "tcp:${port}" 2>/dev/null || true)"
-  elif command -v fuser >/dev/null 2>&1; then
-    pids="$(fuser "${port}/tcp" 2>/dev/null || true)"
-  elif command -v python >/dev/null 2>&1; then
-    pids="$(python - "$port" <<'PY'
+    lsof -ti "tcp:${port}" 2>/dev/null || true
+    return
+  fi
+
+  if command -v fuser >/dev/null 2>&1; then
+    fuser "${port}/tcp" 2>/dev/null || true
+    return
+  fi
+
+  if command -v python >/dev/null 2>&1; then
+    python - "$port" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -74,8 +79,13 @@ for proc in Path("/proc").iterdir():
 
 print(" ".join(sorted(pids, key=int)))
 PY
-)"
   fi
+}
+
+kill_port() {
+  local port="$1"
+  local pids
+  pids="$(port_pids "$port")"
 
   if [ -z "$pids" ]; then
     return
@@ -85,52 +95,7 @@ PY
   kill $pids 2>/dev/null || true
   sleep 1
 
-  if command -v lsof >/dev/null 2>&1; then
-    pids="$(lsof -ti "tcp:${port}" 2>/dev/null || true)"
-  elif command -v fuser >/dev/null 2>&1; then
-    pids="$(fuser "${port}/tcp" 2>/dev/null || true)"
-  elif command -v python >/dev/null 2>&1; then
-    pids="$(python - "$port" <<'PY'
-import os
-import sys
-from pathlib import Path
-
-target_port = int(sys.argv[1])
-target_inodes = set()
-
-for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
-    if not table.exists():
-        continue
-    for line in table.read_text().splitlines()[1:]:
-        fields = line.split()
-        if len(fields) < 10 or fields[3] != "0A":
-            continue
-        port = int(fields[1].rsplit(":", 1)[1], 16)
-        if port == target_port:
-            target_inodes.add(fields[9])
-
-pids = set()
-for proc in Path("/proc").iterdir():
-    if not proc.name.isdigit():
-        continue
-    fd_dir = proc / "fd"
-    if not fd_dir.exists():
-        continue
-    for fd in fd_dir.iterdir():
-        try:
-            link = os.readlink(fd)
-        except OSError:
-            continue
-        if link.startswith("socket:[") and link[8:-1] in target_inodes:
-            pids.add(proc.name)
-            break
-
-print(" ".join(sorted(pids, key=int)))
-PY
-)"
-  else
-    pids=""
-  fi
+  pids="$(port_pids "$port")"
 
   if [ -n "$pids" ]; then
     echo "Force stopping process on port ${port}: ${pids}"

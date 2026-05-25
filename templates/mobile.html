@@ -3,21 +3,21 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>AV1 Video Browser</title>
+    <title>Remote Video Browser</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='mobile.css') }}">
   </head>
   <body>
     <main class="mobile-shell">
       <header class="mobile-header">
         <p class="eyebrow">Mobile playback</p>
-        <h1>AV1 Video Browser</h1>
+        <h1>Remote Video Browser</h1>
         <p class="root-path">{{ root }}</p>
       </header>
 
       <section class="player-card">
         <div class="player-card-head">
           <div>
-            <h2>{{ selected_video.name if selected_video else 'Select an AV1 video' }}</h2>
+            <h2>{{ selected_video.name if selected_video else 'Select a video' }}</h2>
             <p>
               {% if selected_video %}
                 {{ selected_video.folder }} · {{ selected_video.size_label }} · {{ selected_video.modified_label }}
@@ -34,7 +34,7 @@
           {% else %}
             <div class="placeholder">
               <strong>Select a video to play it here</strong>
-              <span>The browser decodes the AV1 file directly.</span>
+              <span>The browser decodes the file directly.</span>
             </div>
           {% endif %}
         </div>

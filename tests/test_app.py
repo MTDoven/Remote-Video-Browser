@@ -19,6 +19,7 @@ def make_video(root: Path, relative_path: str, content: bytes = b"0123456789") -
 def test_list_directory_returns_only_current_level(tmp_path: Path) -> None:
     make_video(tmp_path, "clips/demo.mp4")
     make_video(tmp_path, "movie.mkv")
+    make_video(tmp_path, "extra.mov")
     make_video(tmp_path, "root.mp4")
     (tmp_path / "notes.txt").write_text("ignore me")
 
@@ -27,12 +28,12 @@ def test_list_directory_returns_only_current_level(tmp_path: Path) -> None:
         listing = list_directory(tmp_path, tmp_path)
 
     assert [folder["relative_path"] for folder in listing["folders"]] == ["clips"]
-    assert [video["relative_path"] for video in listing["videos"]] == ["movie.mkv", "root.mp4"]
+    assert [video["relative_path"] for video in listing["videos"]] == ["extra.mov", "movie.mkv", "root.mp4"]
     assert listing["videos"][0]["folder"] == "."
     assert listing["videos"][0]["size"] == 10
     assert "modified_label" in listing["videos"][0]
-    assert listing["videos"][0]["page_url"].endswith("/?dir=&v=movie.mkv")
-    assert listing["videos"][0]["media_url"].endswith("/media/movie.mkv")
+    assert listing["videos"][0]["page_url"].endswith("/?dir=&v=extra.mov")
+    assert listing["videos"][0]["media_url"].endswith("/media/extra.mov")
 
 
 def test_index_route_loads_requested_directory_and_selected_video(tmp_path: Path) -> None:
@@ -108,6 +109,75 @@ def test_media_route_remuxes_mkv_files_to_temp_mp4(tmp_path: Path, monkeypatch: 
     assert response.status_code == 200
     assert response.data == b"mkv-bytes"
     assert response.headers["Content-Type"].startswith("video/mp4")
+
+
+def test_media_route_remuxes_mov_files_to_temp_mp4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = make_video(tmp_path, "clip.mov", b"mov-bytes")
+    fake_ffmpeg = tmp_path / "ffmpeg"
+    fake_ffmpeg.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "input=\"\"\n"
+        "output=\"${@: -1}\"\n"
+        "while (($#)); do\n"
+        "  if [[ \"$1\" == \"-i\" ]]; then\n"
+        "    input=\"$2\"\n"
+        "    shift 2\n"
+        "    continue\n"
+        "  fi\n"
+        "  shift\n"
+        "done\n"
+        "cp \"$input\" \"$output\"\n"
+    )
+    fake_ffmpeg.chmod(0o755)
+    monkeypatch.setenv("FFMPEG_BIN", str(fake_ffmpeg))
+
+    client = create_app(tmp_path).test_client()
+    response = client.get("/media/clip.mov")
+
+    assert response.status_code == 200
+    assert response.data == b"mov-bytes"
+    assert response.headers["Content-Type"].startswith("video/mp4")
+
+
+def test_switching_videos_deletes_previous_temp_remux_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_video(tmp_path, "movie.mkv", b"mkv-bytes")
+    make_video(tmp_path, "next.mp4", b"next-bytes")
+    fake_ffmpeg = tmp_path / "ffmpeg"
+    fake_ffmpeg.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "input=\"\"\n"
+        "output=\"${@: -1}\"\n"
+        "while (($#)); do\n"
+        "  if [[ \"$1\" == \"-i\" ]]; then\n"
+        "    input=\"$2\"\n"
+        "    shift 2\n"
+        "    continue\n"
+        "  fi\n"
+        "  shift\n"
+        "done\n"
+        "cp \"$input\" \"$output\"\n"
+    )
+    fake_ffmpeg.chmod(0o755)
+    monkeypatch.setenv("FFMPEG_BIN", str(fake_ffmpeg))
+    monkeypatch.setattr("app.tempfile.gettempdir", lambda: str(tmp_path))
+
+    client = create_app(tmp_path).test_client()
+    first_response = client.get("/media/movie.mkv")
+    assert first_response.status_code == 200
+
+    cache_dir = tmp_path / "videos-mkv-remux"
+    cache_files = list(cache_dir.glob("*.mp4"))
+    assert len(cache_files) == 1
+    cached_path = cache_files[0]
+    assert cached_path.is_file()
+
+    client.set_cookie("current_video", "movie.mkv")
+    response = client.get("/?v=next.mp4")
+
+    assert response.status_code == 200
+    assert not cached_path.exists()
 
 
 @pytest.mark.parametrize(

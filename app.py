@@ -15,9 +15,23 @@ from functools import lru_cache
 from flask import Flask, Response, abort, render_template, request, url_for
 
 
-VIDEO_EXTENSIONS = {".mp4", ".m4v", ".webm", ".ogg", ".ogv", ".mkv"}
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".m4v",
+    ".webm",
+    ".ogg",
+    ".ogv",
+    ".mkv",
+    ".mov",
+    ".avi",
+    ".wmv",
+    ".ts",
+    ".m2ts",
+}
 DIRECT_PLAY_EXTENSIONS = {".mp4", ".m4v", ".webm", ".ogg", ".ogv"}
+REMUX_TO_MP4_EXTENSIONS = {".mkv", ".mov", ".avi", ".wmv", ".ts", ".m2ts"}
 MOBILE_USER_AGENT_PATTERN = re.compile(r"android|iphone|ipod|ipad|mobile|windows phone|blackberry", re.IGNORECASE)
+CURRENT_VIDEO_COOKIE = "current_video"
 
 
 def create_app(video_root: Path) -> Flask:
@@ -42,15 +56,19 @@ def create_app(video_root: Path) -> Flask:
             selected_video = video_entry(root, selected_path)
             selected_url = url_for("media_file", relative_path=selected_relative)
 
+        cleanup_stale_video_cache(root, request.cookies.get(CURRENT_VIDEO_COOKIE), selected_relative)
         listing = list_directory(root, directory)
         template_name = "mobile.html" if is_mobile_request(request) else "index.html"
-        return render_template(
+        response = render_template(
             template_name,
             root=root,
             listing=listing,
             selected_video=selected_video,
             selected_video_url=selected_url,
         )
+        response = app.make_response(response)
+        response.set_cookie(CURRENT_VIDEO_COOKIE, selected_relative or "", max_age=60 * 60 * 24 * 7, samesite="Lax")
+        return response
 
     @app.route("/media/<path:relative_path>")
     def media_file(relative_path: str) -> Response:
@@ -58,7 +76,7 @@ def create_app(video_root: Path) -> Flask:
         if not file_path.is_file() or file_path.suffix.lower() not in VIDEO_EXTENSIONS:
             abort(404)
 
-        prepared_path, content_type = prepare_media_file(app, file_path)
+        prepared_path, content_type = prepare_media_file(file_path)
         return ranged_file_response(prepared_path, content_type)
 
     return app
@@ -165,11 +183,11 @@ def is_mobile_request(req) -> bool:
     return bool(MOBILE_USER_AGENT_PATTERN.search(user_agent))
 
 
-def prepare_media_file(app: Flask, file_path: Path) -> tuple[Path, str]:
+def prepare_media_file(file_path: Path) -> tuple[Path, str]:
     if file_path.suffix.lower() in DIRECT_PLAY_EXTENSIONS:
         return file_path, content_type_for(file_path)
-    if file_path.suffix.lower() == ".mkv":
-        remuxed_path = remux_mkv_to_mp4(app, file_path)
+    if file_path.suffix.lower() in REMUX_TO_MP4_EXTENSIONS:
+        remuxed_path = remux_video_to_mp4(file_path)
         return remuxed_path, "video/mp4"
     abort(404)
 
@@ -192,10 +210,10 @@ def find_ffmpeg() -> str | None:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def remux_mkv_to_mp4(app: Flask, file_path: Path) -> Path:
+def remux_video_to_mp4(file_path: Path) -> Path:
     ffmpeg_path = find_ffmpeg()
     if not ffmpeg_path:
-        abort(503, description="ffmpeg is required to remux MKV files")
+        abort(503, description="ffmpeg is required to remux video files")
 
     cache_dir = Path(tempfile.gettempdir()) / "videos-mkv-remux"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -251,6 +269,22 @@ def remux_cache_path(cache_dir: Path, file_path: Path) -> Path:
     )
     digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()
     return cache_dir / f"{digest}.mp4"
+
+
+def cleanup_stale_video_cache(root: Path, previous_relative: str | None, current_relative: str) -> None:
+    if not previous_relative or previous_relative == current_relative:
+        return
+
+    try:
+        previous_path = safe_resolve(root, previous_relative)
+    except Exception:
+        return
+
+    if previous_path.suffix.lower() not in REMUX_TO_MP4_EXTENSIONS:
+        return
+
+    cache_path = remux_cache_path(Path(tempfile.gettempdir()) / "videos-mkv-remux", previous_path)
+    cache_path.unlink(missing_ok=True)
 
 
 def parse_range(range_header: str, file_size: int) -> tuple[int, int]:

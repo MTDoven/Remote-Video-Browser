@@ -2,8 +2,7 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VIDEO_DIR="/data/file/AAASSSSS/JapaneseVideos/"
-#VIDEO_DIR="/data/temp/datasets/UltraVideo/"
+VIDEO_DIR="/data/temp/datasets/UltraVideo/"
 PORT="${PORT:-18483}"
 CONDA_ENV="${CONDA_ENV:-videos}"
 LOCAL_FFMPEG="${APP_DIR}/bin/ffmpeg"

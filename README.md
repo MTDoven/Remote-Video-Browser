@@ -8,6 +8,9 @@ A local Flask video browser for native playback. The server scans one directory 
 - Native browser playback with standard `<video>` controls.
 - Common browser-playable video containers are supported directly.
 - Non-native containers such as MKV, MOV, AVI, WMV, TS, and M2TS are remuxed to a temporary MP4 when needed.
+- Each video gets a content-aware thumbnail chosen from an informative frame rather than a blank black or white frame.
+- A dedicated preview button opens a randomly assembled 3x3 contact sheet of video frames.
+- Thumbnail generation is cached and lightly prewarmed in the background so browsing stays responsive.
 - Range responses for streaming-friendly seeking.
 - Mobile browsers are automatically routed to a dedicated mobile layout.
 

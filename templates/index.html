@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Remote Video Browser</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
   </head>
   <body>
     <main class="app-shell">
@@ -34,10 +35,30 @@
           {% endfor %}
 
           {% for video in listing.videos %}
-            <a class="entry video{% if selected_video and selected_video.relative_path == video.relative_path %} active{% endif %}" href="{{ video.page_url }}">
-              <span class="entry-name">{{ video.name }}</span>
-              <span class="entry-meta">{{ video.folder }} · {{ video.size_label }} · {{ video.modified_label }}</span>
-            </a>
+            <article class="entry video{% if selected_video and selected_video.relative_path == video.relative_path %} active{% endif %}">
+              <a class="video-link" href="{{ video.page_url }}">
+                <img
+                  class="video-thumb"
+                  src="{{ video.thumbnail_url }}"
+                  alt=""
+                  loading="{% if loop.index <= 6 %}eager{% else %}lazy{% endif %}"
+                  decoding="async"
+                  {% if loop.index <= 3 %}fetchpriority="high"{% endif %}
+                >
+                <span class="video-copy">
+                  <span class="entry-name">{{ video.name }}</span>
+                  <span class="entry-meta">{{ video.folder }} · {{ video.size_label }} · {{ video.modified_label }}</span>
+                </span>
+              </a>
+              <button
+                type="button"
+                class="preview-button"
+                data-preview-url="{{ video.preview_url }}"
+                data-video-title="{{ video.name }}"
+              >
+                查看详细预览图
+              </button>
+            </article>
           {% endfor %}
         </section>
       </aside>
@@ -69,5 +90,22 @@
         </div>
       </section>
     </main>
+
+    <div class="preview-modal" hidden aria-hidden="true">
+      <div class="preview-backdrop" data-preview-close></div>
+      <section class="preview-dialog" role="dialog" aria-modal="true" aria-label="视频九宫格预览">
+        <header class="preview-head">
+          <div>
+            <p class="eyebrow">Detailed preview</p>
+            <h3 class="preview-title">九宫格预览</h3>
+          </div>
+          <button type="button" class="preview-close" data-preview-close>关闭</button>
+        </header>
+        <div class="preview-body">
+          <div class="preview-loading">预览图生成中…</div>
+          <img class="preview-image" alt="视频九宫格预览">
+        </div>
+      </section>
+    </div>
   </body>
 </html>

@@ -21,6 +21,10 @@ body {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
+body.preview-open {
+  overflow: hidden;
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -177,3 +181,145 @@ video {
   color: var(--accent);
 }
 
+.video {
+  gap: 10px;
+}
+
+.video-link {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.video-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.video-thumb {
+  flex: none;
+  width: 108px;
+  aspect-ratio: 16 / 9;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: linear-gradient(135deg, rgba(116, 214, 176, 0.16), rgba(255, 255, 255, 0.02));
+  object-fit: cover;
+}
+
+.preview-button {
+  justify-self: start;
+  margin-left: 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(116, 214, 176, 0.35);
+  border-radius: 999px;
+  background: rgba(116, 214, 176, 0.08);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.preview-button:hover,
+.preview-button:focus-visible {
+  border-color: rgba(116, 214, 176, 0.65);
+  background: rgba(116, 214, 176, 0.14);
+}
+
+.preview-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+}
+
+.preview-modal[hidden] {
+  display: none;
+}
+
+.preview-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(3, 6, 7, 0.82);
+  backdrop-filter: blur(8px);
+}
+
+.preview-dialog {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(100%, 980px);
+  max-height: calc(100vh - 24px);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: linear-gradient(180deg, rgba(23, 29, 32, 0.98), rgba(12, 16, 18, 0.98));
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.5);
+}
+
+.preview-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 14px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.preview-title {
+  margin-top: 2px;
+  font-size: 18px;
+}
+
+.preview-close {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.preview-body {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 220px;
+  padding: 12px;
+  background:
+    radial-gradient(circle at top left, rgba(116, 214, 176, 0.08), transparent 36%),
+    radial-gradient(circle at bottom right, rgba(116, 214, 176, 0.06), transparent 32%),
+    #06090a;
+}
+
+.preview-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.preview-image {
+  max-width: 100%;
+  max-height: calc(100vh - 160px);
+  border-radius: 14px;
+  background: #050708;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+}
+
+@media (max-width: 640px) {
+  .video-link {
+    align-items: flex-start;
+  }
+
+  .video-thumb {
+    width: 92px;
+  }
+}

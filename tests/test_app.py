@@ -31,7 +31,7 @@ def test_list_directory_returns_only_current_level(tmp_path: Path) -> None:
     assert [video["relative_path"] for video in listing["videos"]] == ["extra.mov", "movie.mkv", "root.mp4"]
     assert listing["videos"][0]["folder"] == "."
     assert listing["videos"][0]["size"] == 10
-    assert "modified_label" in listing["videos"][0]
+    assert "duration_label" in listing["videos"][0]
     assert listing["videos"][0]["page_url"].endswith("/?dir=&v=extra.mov")
     assert listing["videos"][0]["media_url"].endswith("/media/extra.mov")
 
@@ -47,6 +47,20 @@ def test_index_route_loads_requested_directory_and_selected_video(tmp_path: Path
     assert b"clips/demo.mp4" in response.data
     assert b"Native playback" in response.data
     assert b"/media/clips/demo.mp4" in response.data
+    assert b"/media-av1/clips/demo.mp4" in response.data
+    assert b'data-force-encode-av1="0"' in response.data
+    assert b'data-source-duration-seconds=""' in response.data
+
+
+def test_index_route_exposes_force_encode_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_video(tmp_path, "clips/demo.mp4")
+    monkeypatch.setattr("app.FORCE_ENCODE_AV1", True)
+    client = create_app(tmp_path).test_client()
+
+    response = client.get("/?dir=clips&v=clips/demo.mp4")
+
+    assert response.status_code == 200
+    assert b'data-force-encode-av1="1"' in response.data
 
 
 def test_mobile_user_agent_gets_mobile_template(tmp_path: Path) -> None:
@@ -178,6 +192,55 @@ def test_switching_videos_deletes_previous_temp_remux_cache(tmp_path: Path, monk
 
     assert response.status_code == 200
     assert not cached_path.exists()
+
+
+def test_index_route_ignores_missing_previous_video_cookie(tmp_path: Path) -> None:
+    make_video(tmp_path, "present.mp4")
+    client = create_app(tmp_path).test_client()
+    client.set_cookie("current_video", "missing.mkv")
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b"present.mp4" in response.data
+
+
+def test_av1_media_route_streams_realtime_transcode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_video(tmp_path, "movie.mp4", b"source-bytes")
+    args_file = tmp_path / "ffmpeg-args.txt"
+    fake_ffmpeg = tmp_path / "ffmpeg"
+    fake_ffmpeg.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "printf '%s\\n' \"$*\" > \"$FFMPEG_ARGS_FILE\"\n"
+        "printf 'FAKE-AV1-STREAM'\n"
+    )
+    fake_ffmpeg.chmod(0o755)
+    monkeypatch.setenv("FFMPEG_BIN", str(fake_ffmpeg))
+    monkeypatch.setenv("FFMPEG_ARGS_FILE", str(args_file))
+    monkeypatch.setattr("app.select_av1_encoder", lambda _ffmpeg_path: "libsvtav1")
+    monkeypatch.setattr("app.AV1_PRELOAD_MIN_BYTES", 1)
+    monkeypatch.setattr("app.AV1_PRELOAD_TIMEOUT_SECONDS", 1.0)
+
+    client = create_app(tmp_path).test_client()
+    preload_response = client.get("/media-av1/movie.mp4?bandwidth_bps=1000000&start_seconds=12.5&preload=1")
+    response = client.get("/media-av1/movie.mp4?bandwidth_bps=1000000&start_seconds=12.5")
+
+    assert preload_response.status_code == 200
+    assert preload_response.is_json
+    assert preload_response.get_json()["ready"] is True
+    assert response.status_code == 200
+    assert response.data == b"FAKE-AV1-STREAM"
+
+    args = args_file.read_text()
+    assert "-ss 12.500" in args
+    assert "-c:v libsvtav1" in args
+    assert "-svtav1-params rc=1" in args
+    assert "-preset 5" in args
+    assert "-b:v 675000" in args
+    assert "-b:a 75000" in args
 
 
 @pytest.mark.parametrize(

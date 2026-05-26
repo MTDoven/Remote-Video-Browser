@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -47,7 +47,7 @@
                 >
                 <span class="video-copy">
                   <span class="entry-name">{{ video.name }}</span>
-                  <span class="entry-meta">{{ video.folder }} · {{ video.size_label }} · {{ video.modified_label }}</span>
+                  <span class="entry-meta">{{ video.folder }} · {{ video.size_label }} · {{ video.duration_label }}</span>
                 </span>
               </a>
               <button
@@ -56,7 +56,7 @@
                 data-preview-url="{{ video.preview_url }}"
                 data-video-title="{{ video.name }}"
               >
-                查看详细预览图
+                View detailed preview
               </button>
             </article>
           {% endfor %}
@@ -71,7 +71,7 @@
           </div>
           <div class="current-meta">
             {% if selected_video %}
-              {{ selected_video.folder }} · {{ selected_video.size_label }} · {{ selected_video.modified_label }}
+              {{ selected_video.folder }} · {{ selected_video.size_label }} · {{ selected_video.duration_label }}
             {% else %}
               Browser native `<video>` controls
             {% endif %}
@@ -80,7 +80,19 @@
 
         <div class="player-frame">
           {% if selected_video_url %}
-            <video controls autoplay preload="metadata" playsinline src="{{ selected_video_url }}"></video>
+            <video
+              class="player-video"
+              controls
+              autoplay
+              preload="metadata"
+              playsinline
+              src="{{ selected_video_url }}"
+              data-direct-media-url="{{ selected_video_url }}"
+              data-av1-stream-url="{{ selected_video.av1_stream_url }}"
+              data-source-bitrate-bps="{{ selected_video.average_bitrate_bps or '' }}"
+              data-source-duration-seconds="{{ selected_video.duration_seconds or '' }}"
+              data-force-encode-av1="{{ 1 if force_encode_av1 else 0 }}"
+            ></video>
           {% else %}
             <div class="placeholder">
               <strong>Select a video to play it here</strong>
@@ -93,17 +105,17 @@
 
     <div class="preview-modal" hidden aria-hidden="true">
       <div class="preview-backdrop" data-preview-close></div>
-      <section class="preview-dialog" role="dialog" aria-modal="true" aria-label="视频九宫格预览">
+      <section class="preview-dialog" role="dialog" aria-modal="true" aria-label="Video contact sheet preview">
         <header class="preview-head">
           <div>
             <p class="eyebrow">Detailed preview</p>
-            <h3 class="preview-title">九宫格预览</h3>
+            <h3 class="preview-title">Detailed preview</h3>
           </div>
-          <button type="button" class="preview-close" data-preview-close>关闭</button>
+          <button type="button" class="preview-close" data-preview-close>Close</button>
         </header>
         <div class="preview-body">
-          <div class="preview-loading">预览图生成中…</div>
-          <img class="preview-image" alt="视频九宫格预览">
+          <div class="preview-loading">Generating preview...</div>
+          <img class="preview-image" alt="Video contact sheet preview">
         </div>
       </section>
     </div>

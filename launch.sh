@@ -3,9 +3,11 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_DIR="/data/file/AAASSSSS/JapaneseVideos/"
+#VIDEO_DIR="/data/temp/datasets/UltraVideo/"
 PORT="${PORT:-18483}"
 CONDA_ENV="${CONDA_ENV:-videos}"
 LOCAL_FFMPEG="${APP_DIR}/bin/ffmpeg"
+export AV1_TRANSCODE_PRESET=3
 
 find_conda() {
   if command -v conda >/dev/null 2>&1; then

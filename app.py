@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import threading
 import tempfile
+import time
 from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
@@ -48,11 +49,23 @@ THUMBNAIL_MIN_CONTRAST = 14
 THUMBNAIL_CELL_WIDTH = 320
 THUMBNAIL_CELL_HEIGHT = 180
 THUMBNAIL_GRID_GAP = 10
+FORCE_ENCODE_AV1 = os.environ.get("FORCE_ENCODE_AV1") == "1"
+AV1_TRANSCODE_PRESET = int(os.environ.get("AV1_TRANSCODE_PRESET", "5"))
+AV1_TRANSCODE_TARGET_RATIO = 0.75
+AV1_PRELOAD_MIN_BYTES = int(os.environ.get("AV1_PRELOAD_MIN_BYTES", str(512 * 1024)))
+AV1_PRELOAD_TIMEOUT_SECONDS = float(os.environ.get("AV1_PRELOAD_TIMEOUT_SECONDS", "2.0"))
+AV1_SESSION_TTL_SECONDS = float(os.environ.get("AV1_SESSION_TTL_SECONDS", "300"))
 
 _thumbnail_executor = ThreadPoolExecutor(max_workers=THUMBNAIL_WORKERS, thread_name_prefix="video-thumb")
 _thumbnail_futures: dict[str, Future[dict[str, Any]]] = {}
 _thumbnail_futures_lock = threading.Lock()
 _ffmpeg_lookup_cache: tuple[str | None, str | None] | None = None
+_ffprobe_lookup_cache: tuple[str | None, str | None] | None = None
+_ffmpeg_encoder_cache: dict[tuple[str, str], bool] = {}
+_video_duration_cache: dict[str, float | None] = {}
+_video_duration_cache_lock = threading.Lock()
+_av1_sessions: dict[str, "Av1TranscodeSession"] = {}
+_av1_sessions_lock = threading.Lock()
 
 
 def create_app(video_root: Path) -> Flask:
@@ -76,6 +89,8 @@ def create_app(video_root: Path) -> Flask:
             directory = selected_path.parent
             selected_video = video_entry(root, selected_path)
             selected_url = url_for("media_file", relative_path=selected_relative)
+            selected_video["average_bitrate_bps"] = estimate_average_bitrate_bps(selected_path)
+            selected_video["av1_stream_url"] = url_for("av1_media_file", relative_path=selected_relative)
 
         cleanup_stale_video_cache(root, request.cookies.get(CURRENT_VIDEO_COOKIE), selected_relative)
         listing = list_directory(root, directory)
@@ -87,6 +102,7 @@ def create_app(video_root: Path) -> Flask:
             listing=listing,
             selected_video=selected_video,
             selected_video_url=selected_url,
+            force_encode_av1=FORCE_ENCODE_AV1,
         )
         response = app.make_response(response)
         response.set_cookie(CURRENT_VIDEO_COOKIE, selected_relative or "", max_age=60 * 60 * 24 * 7, samesite="Lax")
@@ -100,6 +116,25 @@ def create_app(video_root: Path) -> Flask:
 
         prepared_path, content_type = prepare_media_file(file_path)
         return ranged_file_response(prepared_path, content_type)
+
+    @app.route("/media-av1/<path:relative_path>")
+    def av1_media_file(relative_path: str) -> Response:
+        file_path = safe_resolve(app.config["VIDEO_ROOT"], relative_path)
+        if not file_path.is_file() or file_path.suffix.lower() not in VIDEO_EXTENSIONS:
+            abort(404)
+
+        bandwidth_bps = parse_optional_int(request.args.get("bandwidth_bps"))
+        start_seconds = parse_optional_float(request.args.get("start_seconds")) or 0.0
+        if request.args.get("preload") == "1":
+            session = get_or_create_av1_session(file_path, bandwidth_bps, start_seconds)
+            ready = session.wait_for_preload(AV1_PRELOAD_MIN_BYTES, AV1_PRELOAD_TIMEOUT_SECONDS)
+            payload = {
+                "ready": ready,
+                "bytes_written": session.bytes_written,
+                "preload_threshold": AV1_PRELOAD_MIN_BYTES,
+            }
+            return Response(json.dumps(payload), mimetype="application/json", headers={"Cache-Control": "no-store, max-age=0"})
+        return av1_transcode_response(file_path, bandwidth_bps)
 
     @app.route("/thumb/<path:relative_path>")
     def thumbnail_file(relative_path: str) -> Response:
@@ -177,6 +212,7 @@ def video_entry(root: Path, file_path: Path) -> dict[str, object]:
     folder = file_path.parent.relative_to(root).as_posix() if file_path.parent != root else "."
     cache_token = f"{stat.st_size}-{stat.st_mtime_ns}"
     thumbnail_url = url_for("thumbnail_file", relative_path=relative_path) + f"?v={cache_token}"
+    duration_seconds = estimate_video_duration_seconds(file_path)
     return {
         "type": "video",
         "name": file_path.name,
@@ -188,6 +224,8 @@ def video_entry(root: Path, file_path: Path) -> dict[str, object]:
         "folder": folder,
         "size": stat.st_size,
         "size_label": format_filesize(stat.st_size),
+        "duration_seconds": duration_seconds,
+        "duration_label": format_duration_label(duration_seconds),
         "modified": int(stat.st_mtime),
         "modified_label": modified.strftime("%Y-%m-%d %H:%M"),
     }
@@ -488,6 +526,88 @@ def score_thumbnail_image(image_path: Path, *, relaxed: bool = False) -> dict[st
     return metrics_from_signalstats(metadata, relaxed=relaxed)
 
 
+def estimate_average_bitrate_bps(file_path: Path) -> int | None:
+    ffprobe_path = find_ffprobe()
+    if ffprobe_path:
+        command = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration,bit_rate",
+            "-of",
+            "json",
+            str(file_path),
+        ]
+        try:
+            result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            payload = json.loads((result.stdout or b"{}").decode("utf-8", errors="replace"))
+            format_info = payload.get("format", {})
+            bit_rate = format_info.get("bit_rate")
+            if bit_rate not in (None, "", "N/A"):
+                return int(float(bit_rate))
+
+            duration_value = format_info.get("duration")
+            if duration_value not in (None, "", "N/A"):
+                duration = float(duration_value)
+                if duration > 0:
+                    return int(file_path.stat().st_size * 8 / duration)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    ffmpeg_path = find_ffmpeg()
+    if not ffmpeg_path:
+        return None
+
+    duration = probe_video_duration(ffmpeg_path, file_path)
+    if not duration or duration <= 0:
+        return None
+    return int(file_path.stat().st_size * 8 / duration)
+
+
+def estimate_video_duration_seconds(file_path: Path) -> float | None:
+    cache_key = video_duration_cache_key(file_path)
+    with _video_duration_cache_lock:
+        if cache_key in _video_duration_cache:
+            return _video_duration_cache[cache_key]
+
+    ffprobe_path = find_ffprobe()
+    if ffprobe_path:
+        command = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(file_path),
+        ]
+        try:
+            result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            payload = json.loads((result.stdout or b"{}").decode("utf-8", errors="replace"))
+            format_info = payload.get("format", {})
+            duration_value = format_info.get("duration")
+            if duration_value not in (None, "", "N/A"):
+                duration = float(duration_value)
+                if duration > 0:
+                    with _video_duration_cache_lock:
+                        _video_duration_cache[cache_key] = duration
+                    return duration
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    ffmpeg_path = find_ffmpeg()
+    if not ffmpeg_path:
+        with _video_duration_cache_lock:
+            _video_duration_cache[cache_key] = None
+        return None
+    duration = probe_video_duration(ffmpeg_path, file_path)
+    with _video_duration_cache_lock:
+        _video_duration_cache[cache_key] = duration
+    return duration
+
+
 def metrics_from_signalstats(metadata: dict[str, float], *, relaxed: bool = False) -> dict[str, float] | None:
     if not metadata:
         return None
@@ -584,6 +704,51 @@ def parse_signalstats(raw_output: bytes) -> dict[str, float]:
         except ValueError:
             continue
     return metadata
+
+
+def parse_optional_int(value: str | None) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(float(value))
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def parse_optional_float(value: str | None) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def video_duration_cache_key(file_path: Path) -> str:
+    stat = file_path.stat()
+    fingerprint = "\n".join(
+        [
+            file_path.as_posix(),
+            str(stat.st_size),
+            str(int(stat.st_mtime_ns)),
+            file_path.suffix.lower(),
+        ]
+    )
+    return hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()
+
+
+def format_duration_label(seconds: float | None) -> str:
+    if seconds is None or seconds <= 0:
+        return "Unknown"
+
+    total_seconds = int(round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 def thumbnail_cache_key(file_path: Path) -> str:
@@ -684,6 +849,308 @@ def find_ffmpeg() -> str | None:
     return resolved
 
 
+def find_ffprobe() -> str | None:
+    global _ffprobe_lookup_cache
+
+    configured_ffprobe = os.environ.get("FFPROBE_BIN")
+    if _ffprobe_lookup_cache and _ffprobe_lookup_cache[0] == configured_ffprobe:
+        return _ffprobe_lookup_cache[1]
+
+    if configured_ffprobe and Path(configured_ffprobe).is_file():
+        _ffprobe_lookup_cache = (configured_ffprobe, configured_ffprobe)
+        return configured_ffprobe
+
+    system_ffprobe = shutil.which("ffprobe")
+    if system_ffprobe:
+        _ffprobe_lookup_cache = (configured_ffprobe, system_ffprobe)
+        return system_ffprobe
+
+    ffmpeg_path = find_ffmpeg()
+    if ffmpeg_path:
+        candidate = Path(ffmpeg_path).with_name("ffprobe")
+        if candidate.is_file():
+            resolved = str(candidate)
+            _ffprobe_lookup_cache = (configured_ffprobe, resolved)
+            return resolved
+
+    _ffprobe_lookup_cache = (configured_ffprobe, None)
+    return None
+
+
+def has_ffmpeg_encoder(ffmpeg_path: str, encoder_name: str) -> bool:
+    cache_key = (ffmpeg_path, encoder_name)
+    cached = _ffmpeg_encoder_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-encoders"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError:
+        _ffmpeg_encoder_cache[cache_key] = False
+        return False
+
+    encoders = (result.stdout or b"") + (result.stderr or b"")
+    available = encoder_name.encode("utf-8") in encoders
+    _ffmpeg_encoder_cache[cache_key] = available
+    return available
+
+
+def select_av1_encoder(ffmpeg_path: str) -> str | None:
+    if has_ffmpeg_encoder(ffmpeg_path, "libsvtav1"):
+        return "libsvtav1"
+    if has_ffmpeg_encoder(ffmpeg_path, "libaom-av1"):
+        return "libaom-av1"
+    return None
+
+
+def av1_target_bitrates(file_path: Path, bandwidth_bps: int | None) -> tuple[int, int]:
+    reference_bps = bandwidth_bps or estimate_average_bitrate_bps(file_path) or 1_000_000
+    target_total_bps = max(int(reference_bps * AV1_TRANSCODE_TARGET_RATIO), 128_000)
+    audio_bps = max(min(target_total_bps // 10, 128_000), 32_000)
+    if target_total_bps - audio_bps < 80_000:
+        audio_bps = max(16_000, min(audio_bps, max(target_total_bps // 4, 16_000)))
+    video_bps = max(target_total_bps - audio_bps, 80_000)
+    return video_bps, audio_bps
+
+
+def build_av1_transcode_command(file_path: Path, bandwidth_bps: int | None, start_seconds: float = 0.0) -> list[str]:
+    ffmpeg_path = find_ffmpeg()
+    if not ffmpeg_path:
+        abort(503, description="ffmpeg is required to stream AV1 video")
+
+    encoder = select_av1_encoder(ffmpeg_path)
+    if not encoder:
+        abort(503, description="A supported AV1 encoder is required for realtime transcoding")
+
+    video_bps, audio_bps = av1_target_bitrates(file_path, bandwidth_bps)
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{max(start_seconds, 0.0):.3f}",
+        "-i",
+        str(file_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-dn",
+        "-sn",
+        "-c:v",
+        encoder,
+        "-pix_fmt",
+        "yuv420p",
+        "-tag:v",
+        "av01",
+        "-c:a",
+        "aac",
+        "-b:a",
+        str(audio_bps),
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]
+
+    if encoder == "libsvtav1":
+        command[command.index("-c:v") + 2 : command.index("-pix_fmt")] = [
+            "-preset",
+            str(max(min(AV1_TRANSCODE_PRESET, 13), -2)),
+            "-svtav1-params",
+            "rc=1",
+            "-b:v",
+            str(video_bps),
+        ]
+    else:
+        command[command.index("-c:v") + 2 : command.index("-pix_fmt")] = [
+            "-cpu-used",
+            str(max(min(AV1_TRANSCODE_PRESET, 8), 0)),
+            "-b:v",
+            str(video_bps),
+            "-maxrate",
+            str(video_bps),
+            "-bufsize",
+            str(max(video_bps * 2, video_bps + audio_bps)),
+        ]
+
+    return command
+
+
+class Av1TranscodeSession:
+    def __init__(self, cache_key: str, file_path: Path, bandwidth_bps: int | None, start_seconds: float) -> None:
+        self.cache_key = cache_key
+        self.command = build_av1_transcode_command(file_path, bandwidth_bps, max(start_seconds, 0.0))
+        self.cache_dir = Path(tempfile.gettempdir()) / "videos-av1-transcode"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.output_path = self.cache_dir / f"{cache_key}.mp4"
+        self.output_path.unlink(missing_ok=True)
+        self.output_path.touch(exist_ok=True)
+        self.condition = threading.Condition()
+        self.last_access = time.monotonic()
+        self.bytes_written = 0
+        self.completed = False
+        self.failed = False
+        self.active_readers = 0
+        self.process: subprocess.Popen[bytes] | None = None
+        self.writer_thread = threading.Thread(target=self._pump_stdout, name=f"av1-transcode-{cache_key[:8]}", daemon=True)
+        self._start()
+
+    def _start(self) -> None:
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+        except OSError:
+            self.failed = True
+            self.completed = True
+            self._notify_waiters()
+            return
+
+        self.writer_thread.start()
+
+    def _pump_stdout(self) -> None:
+        assert self.process is not None
+        try:
+            assert self.process.stdout is not None
+            with self.output_path.open("wb") as output_file:
+                while True:
+                    chunk = self.process.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    output_file.write(chunk)
+                    output_file.flush()
+                    with self.condition:
+                        self.bytes_written += len(chunk)
+                        self.last_access = time.monotonic()
+                        self.condition.notify_all()
+        finally:
+            exit_code = self.process.wait()
+            with self.condition:
+                self.completed = True
+                self.failed = exit_code != 0 and self.bytes_written == 0
+                self.last_access = time.monotonic()
+                self.condition.notify_all()
+
+    def _notify_waiters(self) -> None:
+        with self.condition:
+            self.condition.notify_all()
+
+    def wait_for_preload(self, threshold_bytes: int, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        with self.condition:
+            while self.bytes_written < threshold_bytes and not self.completed and not self.failed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.condition.wait(timeout=remaining)
+            return self.bytes_written >= threshold_bytes and not self.failed
+
+    def open_reader(self):
+        with self.condition:
+            self.active_readers += 1
+            self.last_access = time.monotonic()
+
+    def close_reader(self) -> None:
+        with self.condition:
+            self.active_readers = max(self.active_readers - 1, 0)
+            self.last_access = time.monotonic()
+            self.condition.notify_all()
+
+    def stream(self):
+        def generate():
+            offset = 0
+            self.open_reader()
+            try:
+                with self.output_path.open("rb") as input_file:
+                    while True:
+                        with self.condition:
+                            available = self.bytes_written
+                            completed = self.completed
+                            failed = self.failed
+                        if failed:
+                            abort(503, description="Unable to build AV1 stream")
+                        if offset < available:
+                            input_file.seek(offset)
+                            chunk = input_file.read(min(64 * 1024, available - offset))
+                            if chunk:
+                                offset += len(chunk)
+                                yield chunk
+                                continue
+                        if completed:
+                            break
+                        with self.condition:
+                            self.condition.wait(timeout=0.2)
+            finally:
+                self.close_reader()
+
+        return generate()
+
+    def expired(self) -> bool:
+        age = time.monotonic() - self.last_access
+        return self.completed and self.active_readers == 0 and age > AV1_SESSION_TTL_SECONDS
+
+
+def prune_expired_av1_sessions() -> None:
+    with _av1_sessions_lock:
+        expired_keys = [key for key, session in _av1_sessions.items() if session.expired()]
+        for key in expired_keys:
+            session = _av1_sessions.pop(key)
+            session.output_path.unlink(missing_ok=True)
+
+
+def get_or_create_av1_session(file_path: Path, bandwidth_bps: int | None, start_seconds: float = 0.0) -> Av1TranscodeSession:
+    prune_expired_av1_sessions()
+    cache_key = av1_session_key_for(file_path, bandwidth_bps, start_seconds)
+    with _av1_sessions_lock:
+        session = _av1_sessions.get(cache_key)
+        if session is not None and not session.failed:
+            return session
+
+        session = Av1TranscodeSession(cache_key, file_path, bandwidth_bps, start_seconds)
+        _av1_sessions[cache_key] = session
+        return session
+
+
+def av1_session_key_for(file_path: Path, bandwidth_bps: int | None, start_seconds: float) -> str:
+    stat = file_path.stat()
+    bandwidth_bucket = 0 if bandwidth_bps is None else int(round(bandwidth_bps / 100_000.0) * 100_000)
+    start_bucket = int(round(max(start_seconds, 0.0) * 2.0))
+    fingerprint = "\n".join(
+        [
+            file_path.as_posix(),
+            str(stat.st_size),
+            str(int(stat.st_mtime_ns)),
+            str(bandwidth_bucket),
+            str(start_bucket),
+            str(AV1_TRANSCODE_PRESET),
+        ]
+    )
+    return hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()
+
+
+def av1_transcode_response(file_path: Path, bandwidth_bps: int | None) -> Response:
+    session = get_or_create_av1_session(file_path, bandwidth_bps, parse_optional_float(request.args.get("start_seconds")) or 0.0)
+    if session.failed and session.bytes_written == 0:
+        abort(503, description="Unable to build AV1 stream")
+    return Response(
+        session.stream(),
+        mimetype="video/mp4",
+        direct_passthrough=True,
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
 def remux_video_to_mp4(file_path: Path) -> Path:
     ffmpeg_path = find_ffmpeg()
     if not ffmpeg_path:
@@ -755,6 +1222,8 @@ def cleanup_stale_video_cache(root: Path, previous_relative: str | None, current
         return
 
     if previous_path.suffix.lower() not in REMUX_TO_MP4_EXTENSIONS:
+        return
+    if not previous_path.is_file():
         return
 
     cache_path = remux_cache_path(Path(tempfile.gettempdir()) / "videos-mkv-remux", previous_path)

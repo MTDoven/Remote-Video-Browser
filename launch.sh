@@ -4,46 +4,19 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_DIR="/data/temp/datasets/UltraVideo/"
 PORT="${PORT:-18483}"
-CONDA_ENV="${CONDA_ENV:-videos}"
+VENV_DIR="${VENV_DIR:-${APP_DIR}/.venv}"
+PYTHON_BIN="${VENV_DIR}/bin/python"
 LOCAL_FFMPEG="${APP_DIR}/bin/ffmpeg"
 export AV1_TRANSCODE_PRESET=3
-
-find_conda() {
-  if command -v conda >/dev/null 2>&1; then
-    command -v conda
-    return
-  fi
-
-  for candidate in "$HOME/miniconda3/bin/conda" "$HOME/anaconda3/bin/conda" "/opt/conda/bin/conda"; do
-    if [ -x "$candidate" ]; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
-
-  return 1
-}
-
-CONDA_BIN="$(find_conda)" || {
-  echo "Unable to find conda. Install conda or add it to PATH." >&2
-  exit 1
-}
 
 port_pids() {
   local port="$1"
 
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -ti "tcp:${port}" 2>/dev/null || true
-    return
-  fi
+  command -v lsof >/dev/null 2>&1 && { lsof -ti "tcp:${port}" 2>/dev/null || true; return; }
+  command -v fuser >/dev/null 2>&1 && { fuser "${port}/tcp" 2>/dev/null || true; return; }
+  [ -x "$PYTHON_BIN" ] || return
 
-  if command -v fuser >/dev/null 2>&1; then
-    fuser "${port}/tcp" 2>/dev/null || true
-    return
-  fi
-
-  if command -v python >/dev/null 2>&1; then
-    python - "$port" <<'PY'
+  "$PYTHON_BIN" - "$port" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -56,10 +29,7 @@ for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
         continue
     for line in table.read_text().splitlines()[1:]:
         fields = line.split()
-        if len(fields) < 10 or fields[3] != "0A":
-            continue
-        port = int(fields[1].rsplit(":", 1)[1], 16)
-        if port == target_port:
+        if len(fields) >= 10 and fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == target_port:
             target_inodes.add(fields[9])
 
 pids = set()
@@ -67,9 +37,7 @@ for proc in Path("/proc").iterdir():
     if not proc.name.isdigit():
         continue
     fd_dir = proc / "fd"
-    if not fd_dir.exists():
-        continue
-    for fd in fd_dir.iterdir():
+    for fd in fd_dir.iterdir() if fd_dir.exists() else ():
         try:
             link = os.readlink(fd)
         except OSError:
@@ -80,7 +48,6 @@ for proc in Path("/proc").iterdir():
 
 print(" ".join(sorted(pids, key=int)))
 PY
-  fi
 }
 
 kill_port() {
@@ -104,13 +71,15 @@ kill_port() {
   fi
 }
 
-eval "$("$CONDA_BIN" shell.bash hook)"
-conda activate "$CONDA_ENV"
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "Virtual environment not found at ${VENV_DIR}" >&2
+  echo "Create it with: uv venv .venv && uv pip install -r requirements.txt" >&2
+  exit 1
+fi
+
 kill_port "$PORT"
 
 cd "$APP_DIR"
-if [ -z "${FFMPEG_BIN:-}" ] && [ -x "$LOCAL_FFMPEG" ]; then
-  export FFMPEG_BIN="$LOCAL_FFMPEG"
-fi
+[ -n "${FFMPEG_BIN:-}" ] || [ ! -x "$LOCAL_FFMPEG" ] || export FFMPEG_BIN="$LOCAL_FFMPEG"
 
-exec python app.py --port "$PORT" "$VIDEO_DIR"
+exec "$PYTHON_BIN" app.py --port "$PORT" "$VIDEO_DIR"

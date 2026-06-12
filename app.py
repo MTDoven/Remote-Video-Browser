@@ -55,6 +55,7 @@ AV1_TRANSCODE_TARGET_RATIO = 0.75
 AV1_PRELOAD_MIN_BYTES = int(os.environ.get("AV1_PRELOAD_MIN_BYTES", str(512 * 1024)))
 AV1_PRELOAD_TIMEOUT_SECONDS = float(os.environ.get("AV1_PRELOAD_TIMEOUT_SECONDS", "2.0"))
 AV1_SESSION_TTL_SECONDS = float(os.environ.get("AV1_SESSION_TTL_SECONDS", "300"))
+VIDEO_STREAM_CHUNK_SIZE = int(os.environ.get("VIDEO_STREAM_CHUNK_SIZE", str(256 * 1024)))
 
 _thumbnail_executor = ThreadPoolExecutor(max_workers=THUMBNAIL_WORKERS, thread_name_prefix="video-thumb")
 _thumbnail_futures: dict[str, Future[dict[str, Any]]] = {}
@@ -1159,10 +1160,15 @@ def remux_video_to_mp4(file_path: Path) -> Path:
     cache_dir = Path(tempfile.gettempdir()) / "videos-mkv-remux"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = remux_cache_path(cache_dir, file_path)
-    if cache_path.is_file():
+    ready_path = remux_ready_path(cache_path)
+    if cache_path.is_file() and ready_path.is_file():
         return cache_path
+    cache_path.unlink(missing_ok=True)
+    ready_path.unlink(missing_ok=True)
 
-    temp_path = cache_path.with_suffix(".tmp.mp4")
+    thread_id = threading.get_ident()
+    temp_path = cache_path.with_name(f"{cache_path.stem}.{os.getpid()}.{thread_id}.tmp.mp4")
+    audio_codec_args = remux_audio_codec_args(ffmpeg_path, file_path)
     command = [
         ffmpeg_path,
         "-y",
@@ -1179,8 +1185,7 @@ def remux_video_to_mp4(file_path: Path) -> Path:
         "-sn",
         "-c:v",
         "copy",
-        "-c:a",
-        "copy",
+        *audio_codec_args,
         "-movflags",
         "+faststart",
         "-f",
@@ -1195,7 +1200,32 @@ def remux_video_to_mp4(file_path: Path) -> Path:
         abort(500, description=message or "remux failed")
 
     temp_path.replace(cache_path)
+    ready_path.write_text(
+        json.dumps({"source": file_path.as_posix(), "cache": cache_path.name, "created": time.time()}),
+        encoding="utf-8",
+    )
     return cache_path
+
+
+def remux_audio_codec_args(ffmpeg_path: str, file_path: Path) -> list[str]:
+    audio_codec = detect_first_audio_codec(ffmpeg_path, file_path)
+    if audio_codec in {None, "aac", "mp3"}:
+        return ["-c:a", "copy"]
+    return ["-c:a", "aac", "-b:a", "128k"]
+
+
+def detect_first_audio_codec(ffmpeg_path: str, file_path: Path) -> str | None:
+    command = [ffmpeg_path, "-hide_banner", "-i", str(file_path)]
+    try:
+        result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
+        return None
+
+    output = ((result.stdout or b"") + (result.stderr or b"")).decode("utf-8", errors="replace")
+    match = re.search(r"Audio:\s*([^,\s]+)", output)
+    if not match:
+        return None
+    return match.group(1).strip().lower()
 
 
 def remux_cache_path(cache_dir: Path, file_path: Path) -> Path:
@@ -1210,6 +1240,10 @@ def remux_cache_path(cache_dir: Path, file_path: Path) -> Path:
     )
     digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()
     return cache_dir / f"{digest}.mp4"
+
+
+def remux_ready_path(cache_path: Path) -> Path:
+    return cache_path.with_suffix(f"{cache_path.suffix}.ready")
 
 
 def cleanup_stale_video_cache(root: Path, previous_relative: str | None, current_relative: str) -> None:
@@ -1228,33 +1262,38 @@ def cleanup_stale_video_cache(root: Path, previous_relative: str | None, current
 
     cache_path = remux_cache_path(Path(tempfile.gettempdir()) / "videos-mkv-remux", previous_path)
     cache_path.unlink(missing_ok=True)
+    remux_ready_path(cache_path).unlink(missing_ok=True)
 
 
 def parse_range(range_header: str, file_size: int) -> tuple[int, int]:
     unit, _, range_value = range_header.partition("=")
     if unit.strip().lower() != "bytes" or "-" not in range_value:
-        abort(416)
+        abort_range_not_satisfiable(file_size)
 
     start_value, _, end_value = range_value.partition("-")
     try:
         if start_value == "":
             suffix_length = int(end_value)
             if suffix_length <= 0:
-                abort(416)
+                abort_range_not_satisfiable(file_size)
             start = max(file_size - suffix_length, 0)
             end = file_size - 1
         else:
             start = int(start_value)
             end = int(end_value) if end_value else file_size - 1
     except ValueError:
-        abort(416)
+        abort_range_not_satisfiable(file_size)
 
     if start < 0 or end >= file_size or start > end:
-        abort(416)
+        abort_range_not_satisfiable(file_size)
     return start, end
 
 
-def stream_file(file_path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
+def abort_range_not_satisfiable(file_size: int) -> None:
+    abort(Response(status=416, headers={"Content-Range": f"bytes */{file_size}", "Accept-Ranges": "bytes"}))
+
+
+def stream_file(file_path: Path, start: int, end: int, chunk_size: int = VIDEO_STREAM_CHUNK_SIZE):
     with file_path.open("rb") as file:
         file.seek(start)
         remaining = end - start + 1
@@ -1266,29 +1305,45 @@ def stream_file(file_path: Path, start: int, end: int, chunk_size: int = 1024 * 
             yield data
 
 
+def video_stream_headers(file_size: int) -> dict[str, str]:
+    return {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=3600",
+        "Content-Disposition": "inline",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Length": str(file_size),
+    }
+
+
 def ranged_file_response(file_path: Path, content_type: str) -> Response:
     file_size = file_path.stat().st_size
     range_header = request.headers.get("Range")
+    headers = video_stream_headers(file_size)
+
+    if file_size == 0:
+        return Response(b"", mimetype=content_type, headers=headers)
 
     if not range_header:
         return Response(
             stream_file(file_path, 0, file_size - 1),
             mimetype=content_type,
-            headers={"Content-Length": str(file_size), "Accept-Ranges": "bytes"},
+            headers=headers,
             direct_passthrough=True,
         )
 
     start, end = parse_range(range_header, file_size)
     length = end - start + 1
+    headers.update(
+        {
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(length),
+        }
+    )
     return Response(
         stream_file(file_path, start, end),
         status=206,
         mimetype=content_type,
-        headers={
-            "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(length),
-        },
+        headers=headers,
         direct_passthrough=True,
     )
 

@@ -5,20 +5,20 @@ A lightweight Flask app for browsing a video folder in the browser and playing v
 ## Requirements
 
 - Python 3.11+
-- FFmpeg and `ffprobe`
+- FFmpeg. If no system FFmpeg is available, `imageio-ffmpeg` from `requirements.txt` is used as a fallback.
 - A modern browser
 
 ## Install
 
 ```bash
-conda activate videos
-python -m pip install -r requirements.txt
+uv venv .venv
+uv pip install -r requirements.txt
 ```
 
 ## Run
 
 ```bash
-conda run -n videos python app.py /path/to/videos
+.venv/bin/python app.py /path/to/videos
 ```
 
 Default port: `8000`
@@ -32,7 +32,7 @@ To use the helper script:
 ## Test
 
 ```bash
-conda run -n videos python -m pytest -q
+.venv/bin/python -m pytest -q
 ```
 
 ## Notes

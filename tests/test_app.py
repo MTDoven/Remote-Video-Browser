@@ -6,6 +6,9 @@ from app import (
     create_app,
     list_directory,
     parse_range,
+    remux_audio_codec_args,
+    remux_cache_path,
+    remux_ready_path,
 )
 
 
@@ -48,6 +51,7 @@ def test_index_route_loads_requested_directory_and_selected_video(tmp_path: Path
     assert b"Native playback" in response.data
     assert b"/media/clips/demo.mp4" in response.data
     assert b"/media-av1/clips/demo.mp4" in response.data
+    assert b'preload="auto"' in response.data
     assert b'data-force-encode-av1="0"' in response.data
     assert b'data-source-duration-seconds=""' in response.data
 
@@ -94,6 +98,31 @@ def test_media_route_serves_file_with_ranges(tmp_path: Path) -> None:
     assert response.status_code == 206
     assert response.data == b"123"
     assert response.headers["Content-Range"] == "bytes 1-3/10"
+    assert response.headers["Accept-Ranges"] == "bytes"
+    assert response.headers["Cache-Control"] == "public, max-age=3600"
+
+
+def test_media_route_reports_unsatisfied_range_size(tmp_path: Path) -> None:
+    make_video(tmp_path, "demo.mp4")
+    client = create_app(tmp_path).test_client()
+
+    response = client.get("/media/demo.mp4", headers={"Range": "bytes=100-101"})
+
+    assert response.status_code == 416
+    assert response.headers["Content-Range"] == "bytes */10"
+    assert response.headers["Accept-Ranges"] == "bytes"
+
+
+def test_media_route_serves_empty_video_without_negative_range(tmp_path: Path) -> None:
+    make_video(tmp_path, "empty.mp4", b"")
+    client = create_app(tmp_path).test_client()
+
+    response = client.get("/media/empty.mp4")
+
+    assert response.status_code == 200
+    assert response.data == b""
+    assert response.headers["Content-Length"] == "0"
+    assert response.headers["Accept-Ranges"] == "bytes"
 
 
 def test_media_route_remuxes_mkv_files_to_temp_mp4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -152,6 +181,54 @@ def test_media_route_remuxes_mov_files_to_temp_mp4(tmp_path: Path, monkeypatch: 
     assert response.status_code == 200
     assert response.data == b"mov-bytes"
     assert response.headers["Content-Type"].startswith("video/mp4")
+
+
+def test_media_route_rebuilds_unmarked_remux_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = make_video(tmp_path, "movie.mkv", b"fresh-mkv-bytes")
+    fake_ffmpeg = tmp_path / "ffmpeg"
+    fake_ffmpeg.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "input=\"\"\n"
+        "output=\"${@: -1}\"\n"
+        "while (($#)); do\n"
+        "  if [[ \"$1\" == \"-i\" ]]; then\n"
+        "    input=\"$2\"\n"
+        "    shift 2\n"
+        "    continue\n"
+        "  fi\n"
+        "  shift\n"
+        "done\n"
+        "cp \"$input\" \"$output\"\n"
+    )
+    fake_ffmpeg.chmod(0o755)
+    monkeypatch.setenv("FFMPEG_BIN", str(fake_ffmpeg))
+    monkeypatch.setattr("app.tempfile.gettempdir", lambda: str(tmp_path))
+
+    cache_path = remux_cache_path(tmp_path / "videos-mkv-remux", source)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(b"stale-broken-cache")
+
+    client = create_app(tmp_path).test_client()
+    response = client.get("/media/movie.mkv")
+
+    assert response.status_code == 200
+    assert response.data == b"fresh-mkv-bytes"
+    assert cache_path.read_bytes() == b"fresh-mkv-bytes"
+    assert remux_ready_path(cache_path).is_file()
+
+
+def test_opus_audio_is_remuxed_to_aac_without_reencoding_video(tmp_path: Path) -> None:
+    source = make_video(tmp_path, "movie.mkv")
+    fake_ffmpeg = tmp_path / "ffmpeg"
+    fake_ffmpeg.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'Stream #0:1: Audio: opus, 48000 Hz, mono\\n' >&2\n"
+        "exit 1\n"
+    )
+    fake_ffmpeg.chmod(0o755)
+
+    assert remux_audio_codec_args(str(fake_ffmpeg), source) == ["-c:a", "aac", "-b:a", "128k"]
 
 
 def test_switching_videos_deletes_previous_temp_remux_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

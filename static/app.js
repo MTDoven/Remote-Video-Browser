@@ -126,12 +126,11 @@
     const shouldUseAv1 =
       Boolean(av1StreamUrl) &&
       av1Supported &&
-      (forceEncodeAv1 || (sourceBitrateBps > 0 && bandwidthBps !== null && sourceBitrateBps < bandwidthBps * 0.75));
+      (forceEncodeAv1 || (sourceBitrateBps > 0 && bandwidthBps !== null && sourceBitrateBps > bandwidthBps * 0.75));
 
     if (!shouldUseAv1) {
       if (directUrl) {
-        video.src = directUrl;
-        video.load();
+        playDirectStream(video, directUrl);
       }
       return;
     }
@@ -144,7 +143,8 @@
 
     if (av1MseSupported && Number.isFinite(sourceDurationSeconds) && sourceDurationSeconds > 0) {
       try {
-        await playAv1WithMediaSource(video, streamUrl, sourceDurationSeconds);
+        const controller = await playAv1WithMediaSource(video, streamUrl, sourceDurationSeconds);
+        installAv1Fallback(video, controller, directUrl);
         return;
       } catch (error) {
         console.warn("Falling back from AV1 MSE playback:", error);
@@ -155,8 +155,7 @@
       await preloadAv1Stream(streamUrl, 0);
     } catch (error) {
       if (directUrl) {
-        video.src = directUrl;
-        video.load();
+        playDirectStream(video, directUrl);
       }
       return;
     }
@@ -164,6 +163,85 @@
     video.preload = "auto";
     video.src = streamUrl.toString();
     video.load();
+  }
+
+  function playDirectStream(video, directUrl, resumeSeconds = 0, resumePlayback = false) {
+    video.preload = "auto";
+    video.src = directUrl;
+    if (resumeSeconds > 0) {
+      const restorePosition = () => {
+        video.removeEventListener("loadedmetadata", restorePosition);
+        try {
+          video.currentTime = resumeSeconds;
+        } catch (error) {
+          console.warn("Unable to restore playback position:", error);
+        }
+        if (resumePlayback) {
+          void video.play().catch(() => {});
+        }
+      };
+      video.addEventListener("loadedmetadata", restorePosition);
+    }
+    video.load();
+  }
+
+  function installAv1Fallback(video, controller, directUrl) {
+    if (!directUrl) {
+      return;
+    }
+
+    let fallbackTimer = 0;
+    const clearFallbackTimer = () => {
+      if (fallbackTimer) {
+        window.clearTimeout(fallbackTimer);
+        fallbackTimer = 0;
+      }
+    };
+
+    const fallback = (reason) => {
+      if (!controller.active) {
+        return;
+      }
+      const resumeSeconds = video.currentTime || 0;
+      const resumePlayback = !video.paused;
+      cleanup();
+      console.warn(`Falling back to direct playback after AV1 ${reason}`);
+      controller.cleanup();
+      playDirectStream(video, directUrl, resumeSeconds, resumePlayback);
+    };
+
+    const scheduleFallback = (event) => {
+      if (fallbackTimer || video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+        return;
+      }
+      const stalledAt = video.currentTime || 0;
+      fallbackTimer = window.setTimeout(() => {
+        fallbackTimer = 0;
+        if (controller.active && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA && Math.abs((video.currentTime || 0) - stalledAt) < 0.25) {
+          fallback(event.type);
+        }
+      }, 8000);
+    };
+
+    const cleanup = () => {
+      clearFallbackTimer();
+      video.removeEventListener("error", onError);
+      video.removeEventListener("stalled", scheduleFallback);
+      video.removeEventListener("waiting", scheduleFallback);
+      video.removeEventListener("playing", clearFallbackTimer);
+      video.removeEventListener("canplay", clearFallbackTimer);
+      video.removeEventListener("av1streamerror", onAv1StreamError);
+    };
+
+    const onError = () => fallback("error");
+    const onAv1StreamError = () => fallback("stream error");
+
+    video.addEventListener("error", onError);
+    video.addEventListener("stalled", scheduleFallback);
+    video.addEventListener("waiting", scheduleFallback);
+    video.addEventListener("playing", clearFallbackTimer);
+    video.addEventListener("canplay", clearFallbackTimer);
+    video.addEventListener("av1streamerror", onAv1StreamError);
   }
 
   async function preloadAv1Stream(streamUrl, startSeconds) {
@@ -200,6 +278,7 @@
       seekHandler: null,
       currentStartSeconds: 0,
       initializing: false,
+      cleanup: null,
     };
 
     const cleanup = () => {
@@ -215,6 +294,7 @@
         controller.objectUrl = "";
       }
     };
+    controller.cleanup = cleanup;
 
     const attachSession = async (startSeconds, resumePlayback) => {
       if (!controller.active) {
@@ -283,6 +363,7 @@
       }).catch((error) => {
         if (!abortSignal.aborted) {
           console.warn("AV1 MSE session failed:", error);
+          video.dispatchEvent(new Event("av1streamerror"));
         }
       });
     };

@@ -17,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any
+from typing import Any, Callable
 
 from flask import Flask, Response, abort, render_template, request, send_file, url_for
 
@@ -37,6 +37,7 @@ VIDEO_EXTENSIONS = {
 }
 DIRECT_PLAY_EXTENSIONS = {".mp4", ".m4v", ".webm", ".ogg", ".ogv"}
 REMUX_TO_MP4_EXTENSIONS = {".mkv", ".mov", ".avi", ".wmv", ".ts", ".m2ts"}
+BROWSER_PLAYABLE_MP4_AUDIO_CODECS = {None, "aac", "mp3", "opus", "flac", "alac"}
 MOBILE_USER_AGENT_PATTERN = re.compile(r"android|iphone|ipod|ipad|mobile|windows phone|blackberry", re.IGNORECASE)
 CURRENT_VIDEO_COOKIE = "current_video"
 THUMBNAIL_CACHE_DIR_NAME = "videos-thumbnail-cache"
@@ -67,6 +68,8 @@ _video_duration_cache: dict[str, float | None] = {}
 _video_duration_cache_lock = threading.Lock()
 _av1_sessions: dict[str, "Av1TranscodeSession"] = {}
 _av1_sessions_lock = threading.Lock()
+_media_prepare_jobs: dict[str, "MediaPrepareJob"] = {}
+_media_prepare_jobs_lock = threading.Lock()
 
 
 def create_app(video_root: Path) -> Flask:
@@ -117,6 +120,15 @@ def create_app(video_root: Path) -> Flask:
 
         prepared_path, content_type = prepare_media_file(file_path)
         return ranged_file_response(prepared_path, content_type)
+
+    @app.route("/prepare/<path:relative_path>")
+    def prepare_media(relative_path: str) -> Response:
+        file_path = safe_resolve(app.config["VIDEO_ROOT"], relative_path)
+        if not file_path.is_file() or file_path.suffix.lower() not in VIDEO_EXTENSIONS:
+            abort(404)
+
+        status = prepare_media_status(file_path)
+        return Response(json.dumps(status), mimetype="application/json", headers={"Cache-Control": "no-store, max-age=0"})
 
     @app.route("/media-av1/<path:relative_path>")
     def av1_media_file(relative_path: str) -> Response:
@@ -220,6 +232,7 @@ def video_entry(root: Path, file_path: Path) -> dict[str, object]:
         "relative_path": relative_path,
         "page_url": url_for("index", dir=folder if folder != "." else "", v=relative_path),
         "media_url": url_for("media_file", relative_path=relative_path),
+        "prepare_url": url_for("prepare_media", relative_path=relative_path),
         "thumbnail_url": thumbnail_url,
         "preview_url": url_for("preview_sheet", relative_path=relative_path) + f"?v={cache_token}",
         "folder": folder,
@@ -823,6 +836,77 @@ def prepare_media_file(file_path: Path) -> tuple[Path, str]:
     abort(404)
 
 
+class MediaPrepareJob:
+    def __init__(self, file_path: Path) -> None:
+        self.file_path = file_path
+        self.state = "running"
+        self.phase = "Queued"
+        self.progress = 0
+        self.detail = ""
+        self.error = ""
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self._run, name=f"media-prepare-{file_path.name}", daemon=True)
+        self.thread.start()
+
+    def update(self, phase: str, progress: int, detail: str = "") -> None:
+        with self.lock:
+            self.phase = phase
+            self.progress = max(0, min(100, int(progress)))
+            self.detail = detail
+
+    def snapshot(self) -> dict[str, object]:
+        with self.lock:
+            return {
+                "state": self.state,
+                "phase": self.phase,
+                "progress": self.progress,
+                "detail": self.detail,
+                "error": self.error,
+            }
+
+    def _run(self) -> None:
+        try:
+            if self.file_path.suffix.lower() in DIRECT_PLAY_EXTENSIONS:
+                self.update("Ready for browser playback", 100)
+            elif self.file_path.suffix.lower() in REMUX_TO_MP4_EXTENSIONS:
+                remux_video_to_mp4(self.file_path, self.update)
+            else:
+                abort(404)
+        except Exception as error:
+            with self.lock:
+                self.state = "error"
+                self.phase = "Preparation failed"
+                self.error = str(error)
+                self.progress = max(self.progress, 1)
+            return
+
+        with self.lock:
+            self.state = "complete"
+            self.phase = "Ready for playback"
+            self.progress = 100
+
+
+def prepare_media_status(file_path: Path) -> dict[str, object]:
+    if file_path.suffix.lower() in DIRECT_PLAY_EXTENSIONS:
+        return {"state": "complete", "phase": "Ready for browser playback", "progress": 100, "detail": "", "error": ""}
+    if file_path.suffix.lower() in REMUX_TO_MP4_EXTENSIONS and remux_cache_is_ready(file_path):
+        return {"state": "complete", "phase": "Ready cached MP4", "progress": 100, "detail": "", "error": ""}
+
+    job_key = media_prepare_job_key(file_path)
+    with _media_prepare_jobs_lock:
+        job = _media_prepare_jobs.get(job_key)
+        if job is None or job.snapshot()["state"] == "error":
+            job = MediaPrepareJob(file_path)
+            _media_prepare_jobs[job_key] = job
+        return job.snapshot()
+
+
+def media_prepare_job_key(file_path: Path) -> str:
+    stat = file_path.stat()
+    fingerprint = "\n".join([file_path.as_posix(), str(stat.st_size), str(stat.st_mtime_ns), file_path.suffix.lower()])
+    return hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()
+
+
 def find_ffmpeg() -> str | None:
     global _ffmpeg_lookup_cache
 
@@ -1152,7 +1236,7 @@ def av1_transcode_response(file_path: Path, bandwidth_bps: int | None) -> Respon
     )
 
 
-def remux_video_to_mp4(file_path: Path) -> Path:
+def remux_video_to_mp4(file_path: Path, progress_callback: Callable[[str, int, str], None] | None = None) -> Path:
     ffmpeg_path = find_ffmpeg()
     if not ffmpeg_path:
         abort(503, description="ffmpeg is required to remux video files")
@@ -1162,13 +1246,22 @@ def remux_video_to_mp4(file_path: Path) -> Path:
     cache_path = remux_cache_path(cache_dir, file_path)
     ready_path = remux_ready_path(cache_path)
     if cache_path.is_file() and ready_path.is_file():
+        if progress_callback:
+            progress_callback("Ready cached MP4", 100, "")
         return cache_path
     cache_path.unlink(missing_ok=True)
     ready_path.unlink(missing_ok=True)
 
     thread_id = threading.get_ident()
     temp_path = cache_path.with_name(f"{cache_path.stem}.{os.getpid()}.{thread_id}.tmp.mp4")
-    audio_codec_args = remux_audio_codec_args(ffmpeg_path, file_path)
+    if progress_callback:
+        progress_callback("Inspecting audio stream", 8, "")
+    audio_codec = detect_first_audio_codec(ffmpeg_path, file_path)
+    audio_codec_args = remux_audio_codec_args_for_codec(audio_codec)
+    audio_detail = "copying audio" if audio_codec_args == ["-c:a", "copy"] else "transcoding audio to AAC"
+    if progress_callback:
+        progress_callback("Measuring video duration", 12, audio_detail)
+    duration = estimate_video_duration_seconds(file_path) if progress_callback else None
     command = [
         ffmpeg_path,
         "-y",
@@ -1192,8 +1285,14 @@ def remux_video_to_mp4(file_path: Path) -> Path:
         "mp4",
         str(temp_path),
     ]
+    if progress_callback:
+        command[5:5] = ["-nostats", "-progress", "pipe:1"]
+        progress_callback("Preparing MP4 for browser playback", 15, audio_detail)
     try:
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if progress_callback:
+            run_remux_command_with_progress(command, duration, progress_callback, audio_detail)
+        else:
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as error:
         temp_path.unlink(missing_ok=True)
         message = (error.stderr or b"remux failed").decode("utf-8", errors="replace").strip()
@@ -1208,10 +1307,50 @@ def remux_video_to_mp4(file_path: Path) -> Path:
 
 
 def remux_audio_codec_args(ffmpeg_path: str, file_path: Path) -> list[str]:
-    audio_codec = detect_first_audio_codec(ffmpeg_path, file_path)
-    if audio_codec in {None, "aac", "mp3"}:
+    return remux_audio_codec_args_for_codec(detect_first_audio_codec(ffmpeg_path, file_path))
+
+
+def remux_audio_codec_args_for_codec(audio_codec: str | None) -> list[str]:
+    if audio_codec in BROWSER_PLAYABLE_MP4_AUDIO_CODECS:
         return ["-c:a", "copy"]
     return ["-c:a", "aac", "-b:a", "128k"]
+
+
+def run_remux_command_with_progress(
+    command: list[str],
+    duration_seconds: float | None,
+    progress_callback: Callable[[str, int, str], None],
+    detail: str,
+) -> None:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    output_lines = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        stripped = line.strip()
+        key, _, value = stripped.partition("=")
+        if key == "out_time_ms" and duration_seconds and duration_seconds > 0:
+            try:
+                out_seconds = int(value) / 1_000_000
+            except ValueError:
+                continue
+            progress = 15 + int(min(out_seconds / duration_seconds, 1.0) * 80)
+            progress_callback("Preparing MP4 for browser playback", progress, detail)
+        elif key == "progress" and value == "end":
+            progress_callback("Finalizing prepared media", 96, detail)
+        elif stripped:
+            output_lines.append(stripped)
+
+    exit_code = process.wait()
+    if exit_code != 0:
+        stderr = "\n".join(output_lines).encode("utf-8")
+        raise subprocess.CalledProcessError(exit_code, command, stderr=stderr)
 
 
 def detect_first_audio_codec(ffmpeg_path: str, file_path: Path) -> str | None:
@@ -1240,6 +1379,11 @@ def remux_cache_path(cache_dir: Path, file_path: Path) -> Path:
     )
     digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()
     return cache_dir / f"{digest}.mp4"
+
+
+def remux_cache_is_ready(file_path: Path) -> bool:
+    cache_path = remux_cache_path(Path(tempfile.gettempdir()) / "videos-mkv-remux", file_path)
+    return cache_path.is_file() and remux_ready_path(cache_path).is_file()
 
 
 def remux_ready_path(cache_path: Path) -> Path:

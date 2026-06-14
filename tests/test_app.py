@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 
 import pytest
 
@@ -50,8 +51,10 @@ def test_index_route_loads_requested_directory_and_selected_video(tmp_path: Path
     assert b"clips/demo.mp4" in response.data
     assert b"Native playback" in response.data
     assert b"/media/clips/demo.mp4" in response.data
+    assert b"/prepare/clips/demo.mp4" in response.data
     assert b"/media-av1/clips/demo.mp4" in response.data
     assert b'preload="auto"' in response.data
+    assert b"prepare-status" in response.data
     assert b'data-force-encode-av1="0"' in response.data
     assert b'data-source-duration-seconds=""' in response.data
 
@@ -123,6 +126,19 @@ def test_media_route_serves_empty_video_without_negative_range(tmp_path: Path) -
     assert response.data == b""
     assert response.headers["Content-Length"] == "0"
     assert response.headers["Accept-Ranges"] == "bytes"
+
+
+def test_prepare_route_reports_direct_video_ready(tmp_path: Path) -> None:
+    make_video(tmp_path, "demo.mp4")
+    client = create_app(tmp_path).test_client()
+
+    response = client.get("/prepare/demo.mp4")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["state"] == "complete"
+    assert payload["progress"] == 100
+    assert payload["phase"] == "Ready for browser playback"
 
 
 def test_media_route_remuxes_mkv_files_to_temp_mp4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -218,12 +234,65 @@ def test_media_route_rebuilds_unmarked_remux_cache(tmp_path: Path, monkeypatch: 
     assert remux_ready_path(cache_path).is_file()
 
 
-def test_opus_audio_is_remuxed_to_aac_without_reencoding_video(tmp_path: Path) -> None:
+def test_prepare_route_reports_remux_progress_until_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = make_video(tmp_path, "movie.mkv", b"mkv-bytes")
+    fake_ffmpeg = tmp_path / "ffmpeg"
+    fake_ffmpeg.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "input=\"\"\n"
+        "output=\"${@: -1}\"\n"
+        "while (($#)); do\n"
+        "  if [[ \"$1\" == \"-i\" ]]; then\n"
+        "    input=\"$2\"\n"
+        "    shift 2\n"
+        "    continue\n"
+        "  fi\n"
+        "  shift\n"
+        "done\n"
+        "printf 'out_time_ms=1000000\\nprogress=end\\n'\n"
+        "cp \"$input\" \"$output\"\n"
+    )
+    fake_ffmpeg.chmod(0o755)
+    monkeypatch.setenv("FFMPEG_BIN", str(fake_ffmpeg))
+    monkeypatch.setattr("app.tempfile.gettempdir", lambda: str(tmp_path))
+
+    client = create_app(tmp_path).test_client()
+    payload = None
+    for _ in range(20):
+        response = client.get("/prepare/movie.mkv")
+        assert response.status_code == 200
+        payload = response.get_json()
+        if payload["state"] == "complete":
+            break
+        time.sleep(0.01)
+
+    assert payload is not None
+    assert payload["state"] == "complete"
+    assert payload["progress"] == 100
+    assert remux_cache_path(tmp_path / "videos-mkv-remux", source).is_file()
+
+
+@pytest.mark.parametrize("codec", ["aac", "mp3", "opus", "flac", "alac"])
+def test_browser_playable_audio_is_copied_without_reencoding(tmp_path: Path, codec: str) -> None:
     source = make_video(tmp_path, "movie.mkv")
     fake_ffmpeg = tmp_path / "ffmpeg"
     fake_ffmpeg.write_text(
         "#!/usr/bin/env bash\n"
-        "printf 'Stream #0:1: Audio: opus, 48000 Hz, mono\\n' >&2\n"
+        f"printf 'Stream #0:1: Audio: {codec}, 48000 Hz, mono\\n' >&2\n"
+        "exit 1\n"
+    )
+    fake_ffmpeg.chmod(0o755)
+
+    assert remux_audio_codec_args(str(fake_ffmpeg), source) == ["-c:a", "copy"]
+
+
+def test_non_browser_playable_audio_is_remuxed_to_aac_without_reencoding_video(tmp_path: Path) -> None:
+    source = make_video(tmp_path, "movie.mkv")
+    fake_ffmpeg = tmp_path / "ffmpeg"
+    fake_ffmpeg.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'Stream #0:1: Audio: vorbis, 48000 Hz, mono\\n' >&2\n"
         "exit 1\n"
     )
     fake_ffmpeg.chmod(0o755)

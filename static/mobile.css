@@ -96,6 +96,7 @@ p {
 }
 
 .player-frame {
+  position: relative;
   display: grid;
   place-items: center;
   padding: 12px;
@@ -104,9 +105,61 @@ p {
 
 video {
   width: 100%;
+  aspect-ratio: 16 / 9;
   max-height: 52vh;
   background: #000;
   border-radius: 12px;
+}
+
+.prepare-status {
+  position: absolute;
+  z-index: 3;
+  left: 18px;
+  right: 18px;
+  top: 18px;
+  display: grid;
+  gap: 8px;
+  pointer-events: none;
+  padding: 11px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  background: rgba(6, 9, 12, 0.84);
+  color: #f7f9fa;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.35);
+}
+
+.prepare-status[hidden] {
+  display: none;
+}
+
+.prepare-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.prepare-meter {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.prepare-meter-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: #56d8a8;
+  transition: width 180ms ease;
+}
+
+.prepare-detail {
+  min-height: 15px;
+  color: rgba(247, 249, 250, 0.78);
+  font-size: 11px;
 }
 
 .placeholder {

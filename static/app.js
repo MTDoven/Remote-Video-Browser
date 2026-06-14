@@ -116,6 +116,7 @@
 
   async function configurePlayback(video) {
     const directUrl = video.dataset.directMediaUrl || video.getAttribute("src") || "";
+    const prepareUrl = video.dataset.prepareMediaUrl || "";
     const av1StreamUrl = video.dataset.av1StreamUrl || "";
     const sourceBitrateBps = Number(video.dataset.sourceBitrateBps || "0");
     const sourceDurationSeconds = Number(video.dataset.sourceDurationSeconds || "0");
@@ -130,6 +131,12 @@
 
     if (!shouldUseAv1) {
       if (directUrl) {
+        try {
+          await prepareMedia(video, prepareUrl);
+        } catch (error) {
+          showPrepareStatus(video, "Preparation failed", 100, error.message || "Unable to prepare media");
+          return;
+        }
         playDirectStream(video, directUrl);
       }
       return;
@@ -152,20 +159,253 @@
     }
 
     try {
-      await preloadAv1Stream(streamUrl, 0);
+      showPrepareStatus(video, "Preparing AV1 stream", 5, "Starting realtime transcode");
+      await preloadAv1Stream(streamUrl, 0, video);
     } catch (error) {
       if (directUrl) {
-        playDirectStream(video, directUrl);
+        try {
+          await prepareMedia(video, prepareUrl);
+        } catch (prepareError) {
+          showPrepareStatus(video, "Preparation failed", 100, prepareError.message || "Unable to prepare media");
+          return;
+        }
+        playDirectStream(video, directUrl, 0, false, "Loading fallback media stream");
       }
       return;
     }
 
+    installPlaybackLoadStatus(video, "Loading AV1 stream", "Waiting for browser playback buffer");
     video.preload = "auto";
     video.src = streamUrl.toString();
     video.load();
   }
 
-  function playDirectStream(video, directUrl, resumeSeconds = 0, resumePlayback = false) {
+  async function prepareMedia(video, prepareUrl) {
+    if (!prepareUrl) {
+      return;
+    }
+
+    showPrepareStatus(video, "Preparing media", 1, "");
+    while (true) {
+      const response = await fetch(prepareUrl, {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        throw new Error(`Media preparation failed: ${response.status}`);
+      }
+
+      const status = await response.json();
+      showPrepareStatus(video, status.phase || "Preparing media", status.progress || 0, status.detail || "");
+      if (status.state === "complete") {
+        return;
+      }
+      if (status.state === "error") {
+        throw new Error(status.error || "Media preparation failed");
+      }
+      await sleep(350);
+    }
+  }
+
+  function showPrepareStatus(video, phase, progress, detail = "") {
+    const status = video.closest(".player-frame")?.querySelector(".prepare-status");
+    if (!status) {
+      return;
+    }
+
+    const normalizedProgress = Math.max(0, Math.min(100, Number(progress) || 0));
+    const progressLabel = normalizedProgress >= 100 ? "100%" : `${normalizedProgress.toFixed(1).replace(/\.0$/, "")}%`;
+    status.hidden = false;
+    const phaseTarget = status.querySelector(".prepare-phase");
+    const percentTarget = status.querySelector(".prepare-percent");
+    const fillTarget = status.querySelector(".prepare-meter-fill");
+    const detailTarget = status.querySelector(".prepare-detail");
+    if (phaseTarget) {
+      phaseTarget.textContent = phase;
+    }
+    if (percentTarget) {
+      percentTarget.textContent = progressLabel;
+    }
+    if (fillTarget) {
+      fillTarget.style.width = `${normalizedProgress}%`;
+    }
+    if (detailTarget) {
+      detailTarget.textContent = detail;
+    }
+  }
+
+  function hidePrepareStatus(video) {
+    const status = video.closest(".player-frame")?.querySelector(".prepare-status");
+    if (status) {
+      status.hidden = true;
+    }
+  }
+
+  function installPlaybackLoadStatus(video, phase, detail = "") {
+    if (video.prepareLoadCleanup) {
+      video.prepareLoadCleanup();
+    }
+
+    let finished = false;
+    let lastProgress = 95.5;
+    const startedAt = performance.now();
+    let pollTimer = 0;
+    const cleanup = () => {
+      if (pollTimer) {
+        window.clearInterval(pollTimer);
+        pollTimer = 0;
+      }
+      video.removeEventListener("loadstart", update);
+      video.removeEventListener("durationchange", update);
+      video.removeEventListener("loadedmetadata", update);
+      video.removeEventListener("loadeddata", update);
+      video.removeEventListener("progress", update);
+      video.removeEventListener("waiting", update);
+      video.removeEventListener("stalled", update);
+      video.removeEventListener("canplay", ready);
+      video.removeEventListener("canplaythrough", ready);
+      video.removeEventListener("playing", ready);
+      video.removeEventListener("error", failed);
+      video.prepareLoadCleanup = null;
+    };
+    const update = (event = null) => {
+      if (finished) {
+        return;
+      }
+      if (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+        ready();
+        return;
+      }
+      const browserStatus = browserLoadStatus(video, event, startedAt, detail);
+      lastProgress = Math.max(lastProgress, browserStatus.progress);
+      showPrepareStatus(video, browserStatus.phase || phase, lastProgress, browserStatus.detail);
+    };
+    const ready = () => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      showPrepareStatus(video, "Ready for playback", 100, "");
+      window.setTimeout(() => hidePrepareStatus(video), 180);
+      cleanup();
+    };
+    const failed = () => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      showPrepareStatus(video, "Browser playback failed", 100, "The prepared stream could not be decoded");
+      cleanup();
+    };
+
+    video.prepareLoadCleanup = cleanup;
+    video.addEventListener("loadstart", update);
+    video.addEventListener("durationchange", update);
+    video.addEventListener("loadedmetadata", update);
+    video.addEventListener("loadeddata", update);
+    video.addEventListener("progress", update);
+    video.addEventListener("waiting", update);
+    video.addEventListener("stalled", update);
+    video.addEventListener("canplay", ready);
+    video.addEventListener("canplaythrough", ready);
+    video.addEventListener("playing", ready);
+    video.addEventListener("error", failed);
+    pollTimer = window.setInterval(update, 500);
+    update();
+  }
+
+  function browserLoadStatus(video, event, startedAt, fallbackDetail) {
+    const readyState = video.readyState;
+    const bufferedSeconds = bufferedAheadSeconds(video);
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    const elapsedSeconds = Math.max(0, (performance.now() - startedAt) / 1000);
+    const eventType = event?.type || "poll";
+    let phase = "Loading media stream";
+    let progress = 96;
+
+    if (eventType === "loadstart" || readyState === HTMLMediaElement.HAVE_NOTHING) {
+      phase = "Requesting media stream";
+      progress = 96;
+    } else if (readyState === HTMLMediaElement.HAVE_METADATA) {
+      phase = "Reading media metadata";
+      progress = 97;
+    } else if (readyState === HTMLMediaElement.HAVE_CURRENT_DATA) {
+      phase = "Buffering first frame";
+      progress = 98;
+    } else {
+      phase = "Waiting for playback buffer";
+      progress = 98.5;
+    }
+
+    if (bufferedSeconds > 0) {
+      const bufferedRatio = duration > 0 ? Math.min(bufferedSeconds / Math.min(duration, 8), 1) : Math.min(bufferedSeconds / 3, 1);
+      progress = Math.max(progress, 98 + bufferedRatio);
+    }
+    if (eventType === "stalled" || eventType === "waiting") {
+      phase = "Waiting for more buffered data";
+      progress = Math.max(progress, 98.4);
+    }
+
+    const detailParts = [];
+    if (fallbackDetail) {
+      detailParts.push(fallbackDetail);
+    }
+    detailParts.push(`readyState=${readyStateName(readyState)}`);
+    detailParts.push(`networkState=${networkStateName(video.networkState)}`);
+    if (bufferedSeconds > 0) {
+      detailParts.push(`buffered=${bufferedSeconds.toFixed(1)}s`);
+    }
+    if (duration > 0) {
+      detailParts.push(`duration=${formatSeconds(duration)}`);
+    }
+    detailParts.push(`elapsed=${elapsedSeconds.toFixed(1)}s`);
+
+    return { phase, progress: Math.min(progress, 99.4), detail: detailParts.join(" · ") };
+  }
+
+  function bufferedAheadSeconds(video) {
+    if (!video.buffered || video.buffered.length === 0) {
+      return 0;
+    }
+
+    const currentTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    for (let index = 0; index < video.buffered.length; index += 1) {
+      const start = video.buffered.start(index);
+      const end = video.buffered.end(index);
+      if (currentTime >= start - 0.25 && currentTime <= end + 0.25) {
+        return Math.max(0, end - Math.max(start, currentTime));
+      }
+    }
+
+    return Math.max(0, video.buffered.end(video.buffered.length - 1) - video.buffered.start(0));
+  }
+
+  function readyStateName(value) {
+    return ["nothing", "metadata", "current-data", "future-data", "enough-data"][value] || String(value);
+  }
+
+  function networkStateName(value) {
+    return ["empty", "idle", "loading", "no-source"][value] || String(value);
+  }
+
+  function formatSeconds(seconds) {
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      return "0:00";
+    }
+    const rounded = Math.round(seconds);
+    const minutes = Math.floor(rounded / 60);
+    const remainingSeconds = String(rounded % 60).padStart(2, "0");
+    return `${minutes}:${remainingSeconds}`;
+  }
+
+  function sleep(milliseconds) {
+    return new Promise((resolve) => {
+      window.setTimeout(resolve, milliseconds);
+    });
+  }
+
+  function playDirectStream(video, directUrl, resumeSeconds = 0, resumePlayback = false, loadingDetail = "Loading prepared media stream") {
+    installPlaybackLoadStatus(video, "Loading media stream", loadingDetail);
     video.preload = "auto";
     video.src = directUrl;
     if (resumeSeconds > 0) {
@@ -244,7 +484,7 @@
     video.addEventListener("av1streamerror", onAv1StreamError);
   }
 
-  async function preloadAv1Stream(streamUrl, startSeconds) {
+  async function preloadAv1Stream(streamUrl, startSeconds, video = null) {
     const preloadUrl = new URL(streamUrl.toString());
     preloadUrl.searchParams.set("preload", "1");
     preloadUrl.searchParams.set("start_seconds", String(Math.max(0, startSeconds || 0)));
@@ -257,7 +497,13 @@
       throw new Error(`AV1 preload failed: ${response.status}`);
     }
 
-    await response.json();
+    const payload = await response.json();
+    if (video) {
+      const threshold = Number(payload.preload_threshold || "0");
+      const bytesWritten = Number(payload.bytes_written || "0");
+      const progress = threshold > 0 ? Math.min(95, Math.round((bytesWritten / threshold) * 90)) : 50;
+      showPrepareStatus(video, "Preparing AV1 stream", progress, "Buffering realtime transcode");
+    }
   }
 
   function supportsAv1MediaSource() {
@@ -303,7 +549,8 @@
 
       controller.initializing = true;
       controller.currentStartSeconds = Math.max(0, startSeconds || 0);
-      await preloadAv1Stream(streamUrl, controller.currentStartSeconds);
+      showPrepareStatus(video, "Preparing AV1 stream", 5, "Starting realtime transcode");
+      await preloadAv1Stream(streamUrl, controller.currentStartSeconds, video);
       if (controller.abortController) {
         controller.abortController.abort();
       }
@@ -316,6 +563,7 @@
       const mediaSource = new MediaSource();
       controller.mediaSource = mediaSource;
       controller.objectUrl = URL.createObjectURL(mediaSource);
+      installPlaybackLoadStatus(video, "Loading AV1 stream", "Waiting for browser playback buffer");
       video.src = controller.objectUrl;
       video.load();
 

@@ -163,7 +163,7 @@
         const url=await imageBlob(img.dataset.id,'preview',controller.signal,img.dataset.version);
         if(signal.aborted||controller.signal.aborted){URL.revokeObjectURL(url);return;}
         imageURLs.add(url);img.coverURL=url;img.src=url;img.hidden=false;
-      } catch(error){if(error.name!=='AbortError')img.parentElement.title=error.message;}
+      } catch(error){if(error.name!=='AbortError'&&!signal.aborted&&!controller.signal.aborted){img.parentElement.title=error.message;img.src='/static/unavailable.svg';img.alt='Preview unavailable';img.hidden=false;}}
       finally {signal.removeEventListener('abort',abort);if(img.coverController===controller)img.coverController=null;}
     }),{rootMargin:'150px'});
     if(viewState.entries.length) {
@@ -198,7 +198,7 @@
     previewOwner=`preview-${Date.now()}-${Math.random()}`;previewId=entry.id; $('preview-title').textContent=entry.name; $('preview-image').hidden=true; $('preview-status').textContent='Preparing the preview…'; $('preview').showModal();
     try {
       const url=await imageBlob(entry.id,'preview',signal,entry.version,previewOwner);$('preview-image').onload=()=>URL.revokeObjectURL(url);$('preview-image').src=url;$('preview-image').hidden=false;$('preview-status').textContent='Frames at 20%, 40%, 60%, and 80%';
-    } catch(error) {if(error.name!=='AbortError')$('preview-status').textContent=error.message;}
+    } catch(error) {if(error.name!=='AbortError'&&!signal.aborted){$('preview-status').textContent=error.message;$('preview-image').onload=null;$('preview-image').src='/static/unavailable.svg';$('preview-image').hidden=false;}}
   }
   function stopPlayback() {
     samplePlayback();flushViewing(true);viewing=null;playbackSample=null;

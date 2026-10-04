@@ -206,6 +206,11 @@ class Media:
         with self.cache.pin(key):
             if self.cache.get(key):
                 return None
+        if kind == 'preview':
+            failed = self.library.rows('SELECT error FROM preview_failures WHERE video_id=? AND version=? AND retry>?',
+                                       (video['id'], video['version'], time.time()))
+            if failed:
+                raise BrowserError(failed[0]['error'], 422)
         priority = priority if priority is not None else (10 if kind == "poster" else 20)
         return self.jobs.submit(key, lambda cancel: self._image(video, kind, cancel), priority, owner)
 
@@ -220,14 +225,20 @@ class Media:
                 command = [str(self.settings.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", "1",
                            "-i", self.url(video, 10), "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "4", "-threads", "2", "-y", str(image)]
                 self.run(command, work, reservation, cancel, video)
+                if not image.is_file() or image.stat().st_size == 0:
+                    raise BrowserError(f"No video frame could be decoded for {video['path']} at 1 second. The video track may be empty or truncated.", 422)
             else:
                 info = self.cached_json(self.key("metadata", video)) or self._probe(video, cancel, 20)
                 for i, fraction in enumerate((0.2, 0.4, 0.6, 0.8)):
+                    frame = work / f"frame{i:02d}.jpg"
+                    position = info['duration'] * fraction
                     command = [str(self.settings.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error",
-                               "-ss", f"{info['duration'] * fraction:.6f}", "-i", self.url(video, 20),
-                               "-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
-                               "-q:v", "4", "-threads", "2", "-y", str(work / f"frame{i:02d}.jpg")]
+                               "-seek_timestamp", "1", "-ss", f"{position:.6f}", "-i", self.url(video, 20),
+                               "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+                               "-q:v", "4", "-threads", "2", "-y", str(frame)]
                     self.run(command, work, reservation, cancel, video)
+                    if not frame.is_file() or frame.stat().st_size == 0:
+                        raise BrowserError(f"No video frame could be decoded for {video['path']} at {position:.2f} seconds ({fraction:.0%}). The video track may be empty, truncated, or shorter than the reported duration.", 422)
                 image = work / "image.jpg"
                 command = [str(self.settings.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-framerate", "1",
                            "-i", str(work / "frame%02d.jpg"), "-vf", "tile=2x2:padding=4:margin=4", "-frames:v", "1", "-q:v", "3", "-y", str(image)]

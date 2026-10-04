@@ -16,3 +16,5 @@ venv/
 # OS files
 .DS_Store
 Thumbs.db
+
+launch_jv.sh

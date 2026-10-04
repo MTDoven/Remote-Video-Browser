@@ -1,133 +1,39 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Remote Video Browser</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
-    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
-  </head>
-  <body>
-    <main class="app-shell">
-      <aside class="sidebar">
-        <header class="sidebar-head">
-          <h1>Remote Video Browser</h1>
-          <p>{{ root }}</p>
-        </header>
-
-        <nav class="breadcrumbs" aria-label="Breadcrumb">
-          {% for crumb in listing.breadcrumbs %}
-            {% if not loop.first %}<span>/</span>{% endif %}
-            <a href="{{ url_for('index', dir=crumb.path) }}">{{ crumb.name }}</a>
-          {% endfor %}
-        </nav>
-
-        <section class="library">
-          {% if listing.parent is not none %}
-            <a class="entry folder" href="{{ url_for('index', dir=listing.parent) }}">..</a>
-          {% endif %}
-
-          {% for folder in listing.folders %}
-            <a class="entry folder" href="{{ folder.page_url }}">
-              <span class="entry-name">📁 {{ folder.name }}</span>
-              <span class="entry-meta">{{ folder.modified_label }}</span>
-            </a>
-          {% endfor %}
-
-          {% for video in listing.videos %}
-            <article class="entry video{% if selected_video and selected_video.relative_path == video.relative_path %} active{% endif %}">
-              <a class="video-link" href="{{ video.page_url }}">
-                <img
-                  class="video-thumb"
-                  src="{{ video.thumbnail_url }}"
-                  alt=""
-                  loading="{% if loop.index <= 6 %}eager{% else %}lazy{% endif %}"
-                  decoding="async"
-                  {% if loop.index <= 3 %}fetchpriority="high"{% endif %}
-                >
-                <span class="video-copy">
-                  <span class="entry-name">{{ video.name }}</span>
-                  <span class="entry-meta">{{ video.folder }} · {{ video.size_label }} · {{ video.duration_label }}</span>
-                </span>
-              </a>
-              <button
-                type="button"
-                class="preview-button"
-                data-preview-url="{{ video.preview_url }}"
-                data-video-title="{{ video.name }}"
-              >
-                View detailed preview
-              </button>
-            </article>
-          {% endfor %}
-        </section>
-      </aside>
-
-      <section class="player-pane">
-        <header class="player-head">
-          <div>
-            <p class="eyebrow">Native playback</p>
-            <h2>{{ selected_video.name if selected_video else 'Select a video' }}</h2>
-          </div>
-          <div class="current-meta">
-            {% if selected_video %}
-              {{ selected_video.folder }} · {{ selected_video.size_label }} · {{ selected_video.duration_label }}
-            {% else %}
-              Browser native `<video>` controls
-            {% endif %}
-          </div>
-        </header>
-
-        <div class="player-frame">
-          {% if selected_video_url %}
-            <video
-              class="player-video"
-              controls
-              autoplay
-              preload="auto"
-              playsinline
-              data-direct-media-url="{{ selected_video_url }}"
-              data-prepare-media-url="{{ selected_video.prepare_url }}"
-              data-av1-stream-url="{{ selected_video.av1_stream_url }}"
-              data-source-bitrate-bps="{{ selected_video.average_bitrate_bps or '' }}"
-              data-source-duration-seconds="{{ selected_video.duration_seconds or '' }}"
-              data-force-encode-av1="{{ 1 if force_encode_av1 else 0 }}"
-            ></video>
-            <div class="prepare-status" hidden>
-              <div class="prepare-row">
-                <span class="prepare-phase">Preparing media</span>
-                <span class="prepare-percent">0%</span>
-              </div>
-              <div class="prepare-meter" aria-hidden="true">
-                <div class="prepare-meter-fill"></div>
-              </div>
-              <div class="prepare-detail"></div>
-            </div>
-          {% else %}
-            <div class="placeholder">
-              <strong>Select a video to play it here</strong>
-              <span>The browser decodes the file directly.</span>
-            </div>
-          {% endif %}
-        </div>
-      </section>
-    </main>
-
-    <div class="preview-modal" hidden aria-hidden="true">
-      <div class="preview-backdrop" data-preview-close></div>
-      <section class="preview-dialog" role="dialog" aria-modal="true" aria-label="Video contact sheet preview">
-        <header class="preview-head">
-          <div>
-            <p class="eyebrow">Detailed preview</p>
-            <h3 class="preview-title">Detailed preview</h3>
-          </div>
-          <button type="button" class="preview-close" data-preview-close>Close</button>
-        </header>
-        <div class="preview-body">
-          <div class="preview-loading">Generating preview...</div>
-          <img class="preview-image" alt="Video contact sheet preview">
-        </div>
-      </section>
-    </div>
-  </body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#111513">
+  <title>Video Library</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script defer src="/static/vendor/hls-1.7.3.min.js"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <header class="header">
+    <a class="brand" href="#"><span class="brand-icon" aria-hidden="true">▶</span>Library <small>VIDEO LIBRARY</small></a>
+    <label class="search"><svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="search" type="search" placeholder="Search item names…" aria-label="Search item names" autocomplete="off"></label>
+    <button id="refresh" class="button" type="button">↻ <span>Refresh library</span></button>
+  </header>
+  <main class="layout">
+    <section class="library" aria-label="Library">
+      <nav class="tabs"><a href="#mode=recommendations" id="items-tab">Recommendations</a><a href="#mode=directory" id="folders-tab">Browse folders</a><button id="refresh-recommendations" class="recommendations-refresh" type="button" hidden>Refresh recommendations</button></nav>
+      <nav id="breadcrumbs" class="breadcrumbs" aria-label="Current location"></nav>
+      <div class="section-head"><div><p class="eyebrow" id="eyebrow">BROWSE DIRECTORY</p><h1 id="title">Library</h1></div><span id="count" class="muted"></span></div>
+      <div id="library-message" class="message" role="status" hidden></div>
+      <div id="grid" class="grid" aria-live="polite"></div>
+      <button id="load-status" class="load-status" type="button">Loading…</button>
+    </section>
+    <aside class="player-panel" aria-label="Player">
+      <div class="player-heading"><span class="eyebrow">NOW PLAYING</span><button id="close-player" class="icon-button" title="Stop playback" aria-label="Stop playback" hidden>×</button></div>
+      <div class="screen"><video id="player" controls playsinline preload="metadata" hidden></video><div id="player-empty"><span class="play-symbol">▶</span><h2>Choose a video to start watching</h2><p>Original quality · Seek anytime</p></div></div>
+      <h2 id="player-title">No video selected</h2>
+      <p id="player-meta" class="muted">Open an item to browse its videos.</p>
+      <div id="player-status" class="message" role="status" hidden></div>
+      <div class="player-actions"><button id="play-button" class="button primary" hidden>Play</button><button id="fullscreen" class="button" hidden>Fullscreen</button></div>
+    </aside>
+  </main>
+  <footer><span id="library-status">Loading the index…</span><span id="cache-status"></span></footer>
+  <dialog id="preview"><div class="dialog-head"><div><span class="eyebrow">CONTACT SHEET</span><h2 id="preview-title">Detailed preview</h2></div><button id="close-preview" class="icon-button" aria-label="Close preview">×</button></div><p id="preview-status" class="muted" role="status"></p><img id="preview-image" alt="Video contact sheet" hidden></dialog>
+</body>
 </html>
